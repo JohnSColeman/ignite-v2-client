@@ -10,7 +10,7 @@ over TCP.
 
 - [Features](#features)
 - [Protocol Reference](#protocol-reference)
-- [Workspace Structure](#workspace-structure)
+- [Project Structure](#project-structure)
 - [Quick Start](#quick-start)
 - [API Reference](#api-reference)
   - [IgniteClientConfig](#igniteclientconfig)
@@ -81,37 +81,40 @@ Ignite thin client port defaults to **10800**.
 
 ---
 
-## Workspace Structure
+## Project Structure
+
+This is a **single crate** — no workspace members.
 
 ```
-ignite-client/              ← workspace root AND main library crate
-├── Cargo.toml              ← workspace manifest + root package (ignite-v2-client)
-├── src/                    ← public API (crate name: ignite_client)
-│   ├── lib.rs
+ignite-client/
+├── Cargo.toml              ← package manifest (ignite-v2-client, crate: ignite_client)
+├── src/
+│   ├── lib.rs              ← public re-exports
 │   ├── client.rs           ← IgniteClient: query, execute, begin_transaction, cache, …
 │   ├── transaction.rs      ← Transaction: query, execute, commit, rollback, cache, drop
 │   ├── cache.rs            ← IgniteCache: get, put, get_all, put_all, remove, …
 │   ├── stream.rs           ← QueryStream: lazily-paged streaming cursor
 │   ├── query.rs            ← QueryResult, Row, Column, UpdateResult
 │   ├── pool.rs             ← IgniteClientConfig, deadpool manager
-│   └── error.rs            ← IgniteError
-├── tests/
-│   └── smoke.rs            ← 35 end-to-end integration tests
-├── ignite-protocol/        ← pure codec crate: no I/O, no async
-│   └── src/
-│       ├── types.rs        ← IgniteValue enum, op codes, type codes, tx enums
-│       ├── codec.rs        ← encode_value / decode_value roundtrip
-│       ├── handshake.rs    ← protocol 1.7.0 handshake encoding
-│       └── messages.rs     ← SqlFieldsRequest, TxStart/End, cache ops, cursor pagination
-└── ignite-transport/       ← async TCP layer
-    └── src/
-        ├── connection.rs   ← IgniteConnection (pipelined, multiplexed)
-        └── tls.rs          ← build_tls_config (rustls + native-certs)
+│   ├── error.rs            ← IgniteError
+│   ├── protocol/           ← pure codec layer: no I/O, no async
+│   │   ├── mod.rs
+│   │   ├── types.rs        ← IgniteValue enum, op codes, type codes, tx enums
+│   │   ├── codec.rs        ← encode_value / decode_value roundtrip
+│   │   ├── handshake.rs    ← protocol 1.7.0 handshake encoding
+│   │   ├── error.rs        ← ProtocolError
+│   │   └── messages.rs     ← SqlFieldsRequest, TxStart/End, cache ops, cursor pagination
+│   └── transport/          ← async TCP layer
+│       ├── mod.rs
+│       ├── connection.rs   ← IgniteConnection (pipelined, multiplexed)
+│       ├── error.rs        ← TransportError
+│       └── tls.rs          ← build_tls_config (rustls + native-certs)
+└── tests/
+    └── smoke.rs            ← 35 end-to-end integration tests
 ```
 
-The separation of `ignite-protocol` from `ignite-transport` means the codec
-can be tested in isolation (no Ignite node required) and can be used by other
-transport implementations without modification.
+The `protocol` module has no I/O dependency, so its codec tests run without a
+live Ignite node.
 
 ---
 
@@ -535,7 +538,7 @@ round-trip (default 1024).
 
 ## Codec Details
 
-The `ignite-protocol` crate contains the codec with no I/O dependency, making
+The `src/protocol/` module contains the codec with no I/O dependency, making
 it independently testable.
 
 ### Frame format
@@ -615,7 +618,7 @@ are not suitable as a dependency baseline for production work.
 ### Unit tests (no live node required)
 
 ```bash
-cargo test -p ignite-protocol
+cargo test --lib
 ```
 
 Covers:
