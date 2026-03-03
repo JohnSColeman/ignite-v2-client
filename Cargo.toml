@@ -1,0 +1,71 @@
+[package]
+name = "ignite-v2-client"
+version = "0.1.0"
+edition = "2024"
+description = "Apache Ignite v2 Client"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/JohnSColeman/ignite-v2-client.git"
+homepage = "https://github.com/JohnSColeman/ignite-v2-client.git"
+readme = "README.md"
+keywords = ["ignite", "client"]
+categories = ["database"]
+exclude = ["tests/*", "examples/*", "target", "Cargo.lock"]
+authors = ["John Coleman <qbyteconsulting@gmail.com>"]
+
+[lib]
+name = "ignite_client"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+deadpool = { workspace = true }
+async-trait = { workspace = true }
+num-bigint = { workspace = true }
+bigdecimal = { workspace = true }
+uuid = { workspace = true }
+socket2 = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+futures = { workspace = true }
+
+[lints]
+workspace = true
+
+[workspace]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "=1.35.1", features = ["full"] }
+tokio-util = { version = "=0.7.11", features = ["codec"] }
+bytes = "=1.5.0"
+thiserror = "=1.0.50"
+tracing = "=0.1.40"
+futures = "=0.3.30"
+bigdecimal = { version = "=0.4.3", features = ["serde"] }
+uuid = { version = "=1.6.1", features = ["v4"] }
+deadpool = { version = "=0.10.0", features = ["managed", "rt_tokio_1"] }
+async-trait = "=0.1.74"
+num-bigint = "=0.4.4"
+socket2 = "=0.5.7"
+rustls = { version = "=0.23.23", features = ["ring"] }
+tokio-rustls = "=0.26.2"
+rustls-native-certs = "=0.8.1"
+
+[workspace.lints.rust]
+unused_imports    = "warn"
+dead_code         = "warn"
+unused_variables  = "warn"
+
+[workspace.lints.clippy]
+unwrap_used       = "warn"
+expect_used       = "warn"
