@@ -1,7 +1,6 @@
 use std::fmt;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use deadpool::managed::{Manager, Metrics, RecycleError, RecycleResult, Timeouts};
 use deadpool::Runtime;
 
@@ -127,7 +126,6 @@ impl IgniteConnectionManager {
     }
 }
 
-#[async_trait]
 impl Manager for IgniteConnectionManager {
     type Type = IgniteConnection;
     type Error = TransportError;
@@ -161,7 +159,7 @@ impl Manager for IgniteConnectionManager {
             Ok(())
         } else {
             tracing::warn!(address = %self.config.address, "discarding dead connection from pool");
-            Err(RecycleError::StaticMessage("connection is dead"))
+            Err(RecycleError::message("connection is dead"))
         }
     }
 }

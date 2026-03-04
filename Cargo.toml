@@ -1,6 +1,6 @@
 [package]
 name = "ignite-v2-client"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Apache Ignite v2 Client"
 license = "MIT OR Apache-2.0"
@@ -45,21 +45,21 @@ workspace = true
 resolver = "2"
 
 [workspace.dependencies]
-tokio = { version = "=1.35.1", features = ["full"] }
-tokio-util = { version = "=0.7.11", features = ["codec"] }
-bytes = "=1.5.0"
-thiserror = "=1.0.50"
-tracing = "=0.1.40"
-futures = "=0.3.30"
-bigdecimal = { version = "=0.4.3", features = ["serde"] }
-uuid = { version = "=1.6.1", features = ["v4"] }
-deadpool = { version = "=0.10.0", features = ["managed", "rt_tokio_1"] }
-async-trait = "=0.1.74"
-num-bigint = "=0.4.4"
-socket2 = "=0.5.7"
-rustls = { version = "=0.23.23", features = ["ring"] }
-tokio-rustls = "=0.26.2"
-rustls-native-certs = "=0.8.1"
+tokio = { version = "=1.50.0", features = ["full"] }
+tokio-util = { version = "=0.7.18", features = ["codec"] }
+bytes = "=1.11.1"
+thiserror = "=2.0.18"
+tracing = "=0.1.44"
+futures = "=0.3.32"
+bigdecimal = { version = "=0.4.10", features = ["serde"] }
+uuid = { version = "=1.21.0", features = ["v4"] }
+deadpool = { version = "=0.13.0", features = ["managed", "rt_tokio_1"] }
+async-trait = "=0.1.89"
+num-bigint = "=0.4.6"
+socket2 = "=0.6.2"
+rustls = { version = "=0.23.37", features = ["ring"] }
+tokio-rustls = "=0.26.4"
+rustls-native-certs = "=0.8.3"
 
 [workspace.lints.rust]
 unused_imports    = "warn"

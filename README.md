@@ -682,16 +682,27 @@ Smoke test coverage:
 
 ## Cargo.lock dependency pins
 
-Due to MSRV constraints the following crates are pinned to exact versions.
-If your project requires newer versions of these, the workspace root
-`Cargo.toml` `[workspace.dependencies]` section is the single place to update
-them:
+All dependencies are pinned to exact versions for reproducible builds.
+The workspace root `Cargo.toml` `[workspace.dependencies]` section is the
+single place to update them:
 
-| Crate | Pinned version | Reason |
-|---|---|---|
-| `tokio` | `=1.35.1` | system cargo 1.75 compatibility |
-| `uuid` | `=1.6.1` | API stability |
-| `deadpool` | `=0.10.0` | API stability |
+| Crate | Pinned version |
+|---|---|
+| `tokio` | `=1.50.0` |
+| `tokio-util` | `=0.7.18` |
+| `bytes` | `=1.11.1` |
+| `thiserror` | `=2.0.18` |
+| `tracing` | `=0.1.44` |
+| `futures` | `=0.3.32` |
+| `bigdecimal` | `=0.4.10` |
+| `uuid` | `=1.21.0` |
+| `deadpool` | `=0.13.0` |
+| `async-trait` | `=0.1.89` |
+| `num-bigint` | `=0.4.6` |
+| `socket2` | `=0.6.2` |
+| `rustls` | `=0.23.37` |
+| `tokio-rustls` | `=0.26.4` |
+| `rustls-native-certs` | `=0.8.3` |
 
 ---
 
