@@ -14,7 +14,9 @@ pub enum ProtocolError {
     #[error("invalid UTF-8 in string field")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
 
-    #[error("handshake failed (server version {server_major}.{server_minor}.{server_patch}): {message}")]
+    #[error(
+        "handshake failed (server version {server_major}.{server_minor}.{server_patch}): {message}"
+    )]
     HandshakeFailed {
         server_major: i16,
         server_minor: i16,

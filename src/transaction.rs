@@ -2,12 +2,10 @@ use std::sync::Arc;
 
 use tracing;
 
-use crate::protocol::messages::{
-    encode_tx_end, SqlFieldsRequest,
-};
-use crate::protocol::op_code;
 use crate::protocol::IgniteValue;
-use crate::transport::{next_request_id, IgniteConnection, TransportError};
+use crate::protocol::messages::{SqlFieldsRequest, encode_tx_end};
+use crate::protocol::op_code;
+use crate::transport::{IgniteConnection, TransportError, next_request_id};
 
 use crate::cache::IgniteCache;
 use crate::error::{IgniteError, Result};
@@ -36,7 +34,12 @@ pub struct Transaction {
 
 impl Transaction {
     pub(crate) fn new(tx_id: i32, conn: Arc<IgniteConnection>, page_size: i32) -> Self {
-        Self { tx_id, conn, state: TxState::Active, page_size }
+        Self {
+            tx_id,
+            conn,
+            state: TxState::Active,
+            page_size,
+        }
     }
 
     /// Return a [`IgniteCache`] handle that participates in this transaction.
@@ -61,11 +64,7 @@ impl Transaction {
     }
 
     /// Execute a SELECT inside this transaction.  All rows fetched eagerly.
-    pub async fn query(
-        &mut self,
-        sql: &str,
-        params: Vec<IgniteValue>,
-    ) -> Result<QueryResult> {
+    pub async fn query(&mut self, sql: &str, params: Vec<IgniteValue>) -> Result<QueryResult> {
         self.check_active()?;
         let mut req = SqlFieldsRequest::new(sql, params).with_tx(self.tx_id);
         req.page_size = self.page_size;
@@ -106,18 +105,16 @@ impl Transaction {
 
     /// Execute a DML statement (INSERT/UPDATE/DELETE) inside this transaction.
     #[must_use = "futures do nothing unless you `.await` them"]
-    pub async fn execute(
-        &mut self,
-        sql: &str,
-        params: Vec<IgniteValue>,
-    ) -> Result<UpdateResult> {
+    pub async fn execute(&mut self, sql: &str, params: Vec<IgniteValue>) -> Result<UpdateResult> {
         self.check_active()?;
         let req = SqlFieldsRequest {
             statement_type: crate::protocol::StatementType::Update,
             ..SqlFieldsRequest::new(sql, params).with_tx(self.tx_id)
         };
         let result = execute_sql_fields(&self.conn, req).await?;
-        Ok(UpdateResult { rows_affected: extract_rows_affected(&result) })
+        Ok(UpdateResult {
+            rows_affected: extract_rows_affected(&result),
+        })
     }
 
     /// Commit the transaction.
@@ -181,7 +178,7 @@ pub(crate) fn extract_rows_affected(result: &QueryResult) -> i64 {
         .and_then(|r| r.get(0))
         .and_then(|v| match v {
             IgniteValue::Long(n) => Some(*n),
-            IgniteValue::Int(n)  => Some(*n as i64),
+            IgniteValue::Int(n) => Some(*n as i64),
             _ => None,
         })
         .unwrap_or(-1)
@@ -193,20 +190,17 @@ pub(crate) async fn execute_sql_fields(
     conn: &IgniteConnection,
     req: SqlFieldsRequest,
 ) -> Result<QueryResult> {
-    use crate::protocol::messages::{encode_cursor_get_page, SqlFieldsFirstPage, SqlFieldsPage};
+    use crate::protocol::messages::{SqlFieldsFirstPage, SqlFieldsPage, encode_cursor_get_page};
     use crate::protocol::op_code;
 
     let include_field_names = req.include_field_names;
     let req_id = next_request_id();
     let payload = req.encode(op_code::QUERY_SQL_FIELDS, req_id);
 
-    let mut response = conn
-        .request(req_id, payload)
-        .await
-        .map_err(|e| match e {
-            TransportError::Protocol(p) => IgniteError::Protocol(p),
-            other => IgniteError::Transport(other),
-        })?;
+    let mut response = conn.request(req_id, payload).await.map_err(|e| match e {
+        TransportError::Protocol(p) => IgniteError::Protocol(p),
+        other => IgniteError::Transport(other),
+    })?;
 
     let first = SqlFieldsFirstPage::decode(&mut response, include_field_names)
         .map_err(IgniteError::Protocol)?;
@@ -230,7 +224,8 @@ pub(crate) async fn execute_sql_fields(
     // Fetch remaining pages
     while has_more {
         let req_id = next_request_id();
-        let payload = encode_cursor_get_page(op_code::QUERY_SQL_FIELDS_CURSOR_GET_PAGE, req_id, cursor_id);
+        let payload =
+            encode_cursor_get_page(op_code::QUERY_SQL_FIELDS_CURSOR_GET_PAGE, req_id, cursor_id);
         let mut page_response = conn
             .request(req_id, payload)
             .await
@@ -249,5 +244,8 @@ pub(crate) async fn execute_sql_fields(
     let close_payload = crate::protocol::messages::encode_resource_close(close_req_id, cursor_id);
     let _ = conn.request(close_req_id, close_payload).await;
 
-    Ok(QueryResult { columns, rows: all_rows })
+    Ok(QueryResult {
+        columns,
+        rows: all_rows,
+    })
 }

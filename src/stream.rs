@@ -3,12 +3,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use futures::Stream;
 use crate::protocol::messages::{
-    encode_cursor_get_page, encode_resource_close, SqlFieldsFirstPage, SqlFieldsPage,
+    SqlFieldsFirstPage, SqlFieldsPage, encode_cursor_get_page, encode_resource_close,
 };
 use crate::protocol::op_code;
-use crate::transport::{next_request_id, IgniteConnection};
+use crate::transport::{IgniteConnection, next_request_id};
+use futures::Stream;
 
 use crate::error::{IgniteError, Result};
 use crate::query::{Column, Row};
@@ -127,10 +127,7 @@ impl Drop for CursorState {
 ///
 /// `conn` must be a live connection to the same Ignite node that opened the
 /// cursor (the cursor is node-local).
-pub(crate) fn build_stream(
-    conn: Arc<IgniteConnection>,
-    first: SqlFieldsFirstPage,
-) -> QueryStream {
+pub(crate) fn build_stream(conn: Arc<IgniteConnection>, first: SqlFieldsFirstPage) -> QueryStream {
     let columns: Vec<Column> = first
         .field_names
         .iter()

@@ -63,7 +63,10 @@ pub struct QueryResult {
 impl QueryResult {
     /// Returns an empty result set with zero rows and zero columns.
     pub fn empty() -> Self {
-        Self { columns: vec![], rows: vec![] }
+        Self {
+            columns: vec![],
+            rows: vec![],
+        }
     }
 
     /// Number of rows returned.

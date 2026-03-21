@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
+use crate::protocol::IgniteValue;
 use crate::protocol::codec::read_bool;
 use crate::protocol::messages::{
     decode_cache_get_all_response, decode_cache_get_size_response, decode_cache_value_response,
@@ -9,8 +9,8 @@ use crate::protocol::messages::{
     encode_cache_multi_kv_req,
 };
 use crate::protocol::op_code;
-use crate::protocol::IgniteValue;
-use crate::transport::{next_request_id, IgniteConnection};
+use crate::transport::{IgniteConnection, next_request_id};
+use bytes::Bytes;
 
 use crate::error::{IgniteError, Result};
 use crate::pool::Pool;
@@ -26,7 +26,10 @@ use crate::pool::Pool;
 #[derive(Clone, Debug)]
 pub(crate) enum CacheSource {
     Pool(Pool),
-    Tx { tx_id: i32, conn: Arc<IgniteConnection> },
+    Tx {
+        tx_id: i32,
+        conn: Arc<IgniteConnection>,
+    },
 }
 
 // ─── IgniteCache ─────────────────────────────────────────────────────────────
@@ -45,13 +48,19 @@ pub struct IgniteCache {
 impl IgniteCache {
     /// Create a non-transactional cache handle backed by the connection pool.
     pub(crate) fn new(cache_id: i32, pool: Pool) -> Self {
-        Self { cache_id, source: CacheSource::Pool(pool) }
+        Self {
+            cache_id,
+            source: CacheSource::Pool(pool),
+        }
     }
 
     /// Create a transactional cache handle that routes all ops through a
     /// transaction's dedicated connection and embeds `tx_id` in every request.
     pub(crate) fn new_tx(cache_id: i32, tx_id: i32, conn: Arc<IgniteConnection>) -> Self {
-        Self { cache_id, source: CacheSource::Tx { tx_id, conn } }
+        Self {
+            cache_id,
+            source: CacheSource::Tx { tx_id, conn },
+        }
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -72,11 +81,14 @@ impl IgniteCache {
         match &self.source {
             CacheSource::Pool(pool) => {
                 let conn = pool.get().await?;
-                conn.request(req_id, payload).await.map_err(IgniteError::Transport)
+                conn.request(req_id, payload)
+                    .await
+                    .map_err(IgniteError::Transport)
             }
-            CacheSource::Tx { conn, .. } => {
-                conn.request(req_id, payload).await.map_err(IgniteError::Transport)
-            }
+            CacheSource::Tx { conn, .. } => conn
+                .request(req_id, payload)
+                .await
+                .map_err(IgniteError::Transport),
         }
     }
 
@@ -85,8 +97,13 @@ impl IgniteCache {
     /// Retrieve a value by key.  Returns `IgniteValue::Null` if the key is not present.
     pub async fn get(&self, key: IgniteValue) -> Result<IgniteValue> {
         let req_id = next_request_id();
-        let payload =
-            encode_cache_key_req(op_code::CACHE_GET, req_id, self.cache_id, &key, self.tx_id());
+        let payload = encode_cache_key_req(
+            op_code::CACHE_GET,
+            req_id,
+            self.cache_id,
+            &key,
+            self.tx_id(),
+        );
         let mut resp = self.send(req_id, payload).await?;
         decode_cache_value_response(&mut resp).map_err(IgniteError::Protocol)
     }
@@ -125,10 +142,7 @@ impl IgniteCache {
 
     /// Retrieve values for multiple keys.
     /// Returns only the pairs for keys that exist in the cache; absent keys are omitted.
-    pub async fn get_all(
-        &self,
-        keys: Vec<IgniteValue>,
-    ) -> Result<Vec<(IgniteValue, IgniteValue)>> {
+    pub async fn get_all(&self, keys: Vec<IgniteValue>) -> Result<Vec<(IgniteValue, IgniteValue)>> {
         let req_id = next_request_id();
         let payload = encode_cache_multi_key_req(
             op_code::CACHE_GET_ALL,

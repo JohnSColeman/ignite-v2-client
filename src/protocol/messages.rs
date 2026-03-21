@@ -13,8 +13,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use super::codec::{
-    decode_value, encode_value, read_bool, read_i16_le, read_i32_le, read_i64_le,
-    read_u8, write_bool, write_string, write_string_nullable,
+    decode_value, encode_value, read_bool, read_i16_le, read_i32_le, read_i64_le, read_u8,
+    write_bool, write_string, write_string_nullable,
 };
 use super::error::{ProtocolError, Result};
 use super::types::{IgniteValue, StatementType, TxConcurrency, TxIsolation};
@@ -57,9 +57,11 @@ pub fn read_response_header(buf: &mut Bytes) -> Result<i64> {
     if flags & FLAG_ERROR != 0 {
         // Error response: read status code and message
         let status = read_i32_le(buf)?;
-        let msg = read_typed_error_message(buf)
-            .unwrap_or_else(|| format!("error code {status}"));
-        return Err(ProtocolError::ServerError { status, message: msg });
+        let msg = read_typed_error_message(buf).unwrap_or_else(|| format!("error code {status}"));
+        return Err(ProtocolError::ServerError {
+            status,
+            message: msg,
+        });
     }
     Ok(request_id)
 }
@@ -151,7 +153,11 @@ impl SqlFieldsRequest {
         buf.put_i32_le(self.cache_id);
         // Flags byte: CACHE_FLAG_TX (0x02) = transactional.  tx_id follows
         // immediately after this byte when the transactional flag is set.
-        let flags: u8 = if self.tx_id.is_some() { CACHE_FLAG_TX } else { 0x00 };
+        let flags: u8 = if self.tx_id.is_some() {
+            CACHE_FLAG_TX
+        } else {
+            0x00
+        };
         buf.put_u8(flags);
         if let Some(tx_id) = self.tx_id {
             buf.put_i32_le(tx_id);
@@ -160,7 +166,10 @@ impl SqlFieldsRequest {
         buf.put_i32_le(self.page_size);
         buf.put_i32_le(self.max_rows);
         write_string(&mut buf, &self.sql);
-        debug_assert!(self.params.len() <= i32::MAX as usize, "too many SQL parameters for wire format");
+        debug_assert!(
+            self.params.len() <= i32::MAX as usize,
+            "too many SQL parameters for wire format"
+        );
         buf.put_i32_le(self.params.len() as i32);
         for param in &self.params {
             encode_value(&mut buf, param);
@@ -191,24 +200,25 @@ impl SqlFieldsFirstPage {
         let cursor_id = read_i64_le(buf)?;
         let field_count = read_i32_le(buf)? as usize;
 
-        let field_names = if include_field_names {
-            let mut names = Vec::with_capacity(field_count);
-            for _ in 0..field_count {
-                // Field names are typed strings: type_code (u8) + i32 len + bytes
+        let mut field_names = vec![String::new(); field_count];
+        if include_field_names {
+            for name in field_names.iter_mut() {
                 let val = decode_value(buf)?;
-                names.push(match val {
+                *name = match val {
                     IgniteValue::String(s) => s,
                     _ => String::new(),
-                });
+                };
             }
-            names
-        } else {
-            vec!["".to_string(); field_count]
-        };
+        }
 
         let (rows, has_more) = decode_rows(buf, field_count)?;
 
-        Ok(Self { cursor_id, field_names, rows, has_more })
+        Ok(Self {
+            cursor_id,
+            field_names,
+            rows,
+            has_more,
+        })
     }
 }
 
@@ -347,7 +357,10 @@ pub fn encode_cache_multi_key_req(
 ) -> Bytes {
     let mut buf = BytesMut::new();
     write_cache_header(&mut buf, op, req_id, cache_id, tx_id);
-    debug_assert!(keys.len() <= i32::MAX as usize, "too many keys for wire format");
+    debug_assert!(
+        keys.len() <= i32::MAX as usize,
+        "too many keys for wire format"
+    );
     buf.put_i32_le(keys.len() as i32);
     for k in keys {
         encode_value(&mut buf, k);
@@ -365,7 +378,10 @@ pub fn encode_cache_multi_kv_req(
 ) -> Bytes {
     let mut buf = BytesMut::new();
     write_cache_header(&mut buf, op, req_id, cache_id, tx_id);
-    debug_assert!(entries.len() <= i32::MAX as usize, "too many entries for wire format");
+    debug_assert!(
+        entries.len() <= i32::MAX as usize,
+        "too many entries for wire format"
+    );
     buf.put_i32_le(entries.len() as i32);
     for (k, v) in entries {
         encode_value(&mut buf, k);
@@ -427,12 +443,12 @@ pub fn encode_cache_create_with_config(
     let mut buf = BytesMut::new();
     write_request_header(&mut buf, op, req_id);
 
-    buf.put_i32_le(config_len);     // config_total_length
-    buf.put_i16_le(2i16);           // prop_count = 2
+    buf.put_i32_le(config_len); // config_total_length
+    buf.put_i16_le(2i16); // prop_count = 2
 
     // Property 0 — NAME: [i16: prop_id=0][typed STRING: name]  (type-code 0x09 + i32 len + utf8)
     buf.put_i16_le(0i16);
-    write_string(&mut buf, name);   // [u8: 0x09][i32: len][utf8]
+    write_string(&mut buf, name); // [u8: 0x09][i32: len][utf8]
 
     // Property 2 — ATOMICITY MODE: [i16: prop_id=2][i32: raw int]
     // CacheAtomicityMode: 0=TRANSACTIONAL, 1=ATOMIC
@@ -502,7 +518,14 @@ mod tests {
 
     #[test]
     fn tx_encode_decode() {
-        let payload = encode_tx_start(4000, 99, TxConcurrency::Pessimistic, TxIsolation::ReadCommitted, 5000, None);
+        let payload = encode_tx_start(
+            4000,
+            99,
+            TxConcurrency::Pessimistic,
+            TxIsolation::ReadCommitted,
+            5000,
+            None,
+        );
         // Verify op_code at start
         let op = i16::from_le_bytes([payload[0], payload[1]]);
         assert_eq!(op, 4000);

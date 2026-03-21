@@ -1,8 +1,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use super::codec::{read_i16_le, read_i32_le, read_u8};
-use super::types::type_code;
 use super::error::{ProtocolError, Result};
+use super::types::type_code;
 
 /// Thin client type code (as opposed to node-to-node protocol).
 const CLIENT_TYPE_THIN: u8 = 2;
@@ -37,7 +37,7 @@ impl HandshakeRequest {
         // inserted between client_code and the auth credentials.
         // We advertise no optional features: empty byte array (type 12, length 0).
         buf.put_u8(type_code::BYTE_ARRAY); // BYTE_ARRAY type code
-        buf.put_i32_le(0);                 // zero length — no feature bits set
+        buf.put_i32_le(0); // zero length — no feature bits set
 
         // Auth credentials follow as nullable byte[] fields:
         //   None  -- type code 101 (NULL)

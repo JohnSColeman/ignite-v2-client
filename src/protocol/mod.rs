@@ -5,4 +5,7 @@ pub mod messages;
 pub mod types;
 
 pub use error::ProtocolError;
-pub use types::{op_code, IgniteValue, StatementType, TxConcurrency, TxIsolation, java_hash, cache_id};
+pub use types::{
+    ColumnType, IgniteValue, StatementType, TxConcurrency, TxIsolation, cache_id, java_hash,
+    op_code,
+};

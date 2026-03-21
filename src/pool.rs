@@ -1,8 +1,8 @@
 use std::fmt;
 use std::time::Duration;
 
-use deadpool::managed::{Manager, Metrics, RecycleError, RecycleResult, Timeouts};
 use deadpool::Runtime;
+use deadpool::managed::{Manager, Metrics, RecycleError, RecycleResult, Timeouts};
 
 use crate::protocol::handshake::HandshakeRequest;
 use crate::transport::{IgniteConnection, TransportError};
@@ -131,12 +131,11 @@ impl Manager for IgniteConnectionManager {
     type Error = TransportError;
 
     async fn create(&self) -> std::result::Result<IgniteConnection, TransportError> {
-        let hs = HandshakeRequest::new(
-            self.config.username.clone(),
-            self.config.password.clone(),
-        );
+        let hs = HandshakeRequest::new(self.config.username.clone(), self.config.password.clone());
         let tls = if self.config.use_tls {
-            Some(crate::transport::build_tls_config(self.config.tls_accept_invalid_certs)?)
+            Some(crate::transport::build_tls_config(
+                self.config.tls_accept_invalid_certs,
+            )?)
         } else {
             None
         };

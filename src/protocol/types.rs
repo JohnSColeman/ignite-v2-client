@@ -1,24 +1,25 @@
 use bigdecimal::BigDecimal;
+use std::fmt;
 use uuid::Uuid;
 
 // ─── Type codes ──────────────────────────────────────────────────────────────
 
 pub mod type_code {
     #![allow(dead_code)]
-    pub const BYTE: u8       = 1;
-    pub const SHORT: u8      = 2;
-    pub const INT: u8        = 3;
-    pub const LONG: u8       = 4;
-    pub const FLOAT: u8      = 5;
-    pub const DOUBLE: u8     = 6;
-    pub const CHAR: u8       = 7;
-    pub const BOOL: u8       = 8;
-    pub const STRING: u8     = 9;
-    pub const UUID: u8       = 10;
-    pub const DATE: u8       = 11;
+    pub const BYTE: u8 = 1;
+    pub const SHORT: u8 = 2;
+    pub const INT: u8 = 3;
+    pub const LONG: u8 = 4;
+    pub const FLOAT: u8 = 5;
+    pub const DOUBLE: u8 = 6;
+    pub const CHAR: u8 = 7;
+    pub const BOOL: u8 = 8;
+    pub const STRING: u8 = 9;
+    pub const UUID: u8 = 10;
+    pub const DATE: u8 = 11;
     pub const BYTE_ARRAY: u8 = 12;
     pub const SHORT_ARRAY: u8 = 13;
-    pub const INT_ARRAY: u8  = 14;
+    pub const INT_ARRAY: u8 = 14;
     pub const LONG_ARRAY: u8 = 15;
     pub const FLOAT_ARRAY: u8 = 16;
     pub const DOUBLE_ARRAY: u8 = 17;
@@ -27,52 +28,57 @@ pub mod type_code {
     pub const STRING_ARRAY: u8 = 20;
     pub const UUID_ARRAY: u8 = 21;
     pub const DATE_ARRAY: u8 = 22;
-    pub const DECIMAL: u8    = 30;
+    pub const DECIMAL: u8 = 30;
     pub const DECIMAL_ARRAY: u8 = 31;
-    pub const TIMESTAMP: u8  = 33;
+    pub const TIMESTAMP: u8 = 33;
     pub const TIMESTAMP_ARRAY: u8 = 34;
-    pub const TIME: u8       = 36;
+    pub const TIME: u8 = 36;
     pub const TIME_ARRAY: u8 = 37;
-    pub const ENUM: u8       = 28;
+    pub const ENUM: u8 = 28;
     pub const ENUM_ARRAY: u8 = 29;
     pub const BINARY_OBJECT: u8 = 27;
     pub const COMPLEX_OBJECT: u8 = 103;
-    pub const NULL: u8       = 101;
-    pub const HANDLE: u8     = 104;
+    pub const NULL: u8 = 101;
+    pub const HANDLE: u8 = 104;
     pub const OBJECT_ARRAY: u8 = 23;
-    pub const MAP: u8        = 25;
+    pub const MAP: u8 = 25;
+    /// "Optimised marshaller" — Ignite uses this type code when a value is
+    /// serialised with Java's `ObjectOutputStream` rather than the Ignite
+    /// binary codec.  Used for `java.sql.Date`, `java.sql.Time`, and
+    /// `java.sql.Timestamp` when returned by `OP_QUERY_SQL_FIELDS`.
+    pub const OPTM_MARSH: u8 = 0xFE;
 }
 
 // ─── Op codes ─────────────────────────────────────────────────────────────────
 
 pub mod op_code {
     #![allow(dead_code)]
-    pub const RESOURCE_CLOSE: i16             = 0;
-    pub const CACHE_GET: i16                  = 1000;
-    pub const CACHE_PUT: i16                  = 1001;
-    pub const CACHE_PUT_IF_ABSENT: i16        = 1002;
-    pub const CACHE_GET_ALL: i16              = 1003;
-    pub const CACHE_PUT_ALL: i16              = 1004;
-    pub const CACHE_GET_AND_PUT: i16          = 1005;
-    pub const CACHE_GET_AND_REMOVE: i16       = 1007;
-    pub const CACHE_GET_AND_REPLACE: i16      = 1006;
-    pub const CACHE_REPLACE: i16              = 1009;
-    pub const CACHE_CONTAINS_KEY: i16         = 1011;
-    pub const CACHE_REMOVE_KEY: i16           = 1019;
-    pub const CACHE_REMOVE_KEYS: i16          = 1021;
-    pub const CACHE_REMOVE_ALL: i16           = 1022;
-    pub const CACHE_GET_NAMES: i16            = 1050;
+    pub const RESOURCE_CLOSE: i16 = 0;
+    pub const CACHE_GET: i16 = 1000;
+    pub const CACHE_PUT: i16 = 1001;
+    pub const CACHE_PUT_IF_ABSENT: i16 = 1002;
+    pub const CACHE_GET_ALL: i16 = 1003;
+    pub const CACHE_PUT_ALL: i16 = 1004;
+    pub const CACHE_GET_AND_PUT: i16 = 1005;
+    pub const CACHE_GET_AND_REMOVE: i16 = 1007;
+    pub const CACHE_GET_AND_REPLACE: i16 = 1006;
+    pub const CACHE_REPLACE: i16 = 1009;
+    pub const CACHE_CONTAINS_KEY: i16 = 1011;
+    pub const CACHE_REMOVE_KEY: i16 = 1019;
+    pub const CACHE_REMOVE_KEYS: i16 = 1021;
+    pub const CACHE_REMOVE_ALL: i16 = 1022;
+    pub const CACHE_GET_NAMES: i16 = 1050;
     pub const CACHE_GET_OR_CREATE_WITH_NAME: i16 = 1052;
-    pub const CACHE_CREATE_WITH_CONFIGURATION: i16        = 1051;
+    pub const CACHE_CREATE_WITH_CONFIGURATION: i16 = 1051;
     pub const CACHE_GET_OR_CREATE_WITH_CONFIGURATION: i16 = 1053;
-    pub const CACHE_DESTROY: i16              = 1056;
-    pub const CACHE_GET_SIZE: i16             = 1020;
-    pub const CACHE_PARTITIONS: i16           = 1100;
-    pub const QUERY_SQL: i16                  = 2002;   // deprecated
-    pub const QUERY_SQL_FIELDS: i16           = 2004;
+    pub const CACHE_DESTROY: i16 = 1056;
+    pub const CACHE_GET_SIZE: i16 = 1020;
+    pub const CACHE_PARTITIONS: i16 = 1100;
+    pub const QUERY_SQL: i16 = 2002; // deprecated
+    pub const QUERY_SQL_FIELDS: i16 = 2004;
     pub const QUERY_SQL_FIELDS_CURSOR_GET_PAGE: i16 = 2005;
-    pub const TX_START: i16                   = 4000;
-    pub const TX_END: i16                     = 4001;
+    pub const TX_START: i16 = 4000;
+    pub const TX_END: i16 = 4001;
 }
 
 // ─── Transaction enums ────────────────────────────────────────────────────────
@@ -80,16 +86,16 @@ pub mod op_code {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum TxConcurrency {
-    Optimistic  = 0,
+    Optimistic = 0,
     Pessimistic = 1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum TxIsolation {
-    ReadCommitted   = 0,
-    RepeatableRead  = 1,
-    Serializable    = 2,
+    ReadCommitted = 0,
+    RepeatableRead = 1,
+    Serializable = 2,
 }
 
 // ─── Statement types ─────────────────────────────────────────────────────────
@@ -97,7 +103,7 @@ pub enum TxIsolation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i8)]
 pub enum StatementType {
-    Any    = 0,
+    Any = 0,
     Select = 1,
     Update = 2,
 }
@@ -147,6 +153,100 @@ pub enum IgniteValue {
     RawObject(Vec<u8>),
 }
 
+// ─── Column type ─────────────────────────────────────────────────────────────
+
+/// The SQL type of a value returned by Ignite, inferred from the 1-byte
+/// wire type-tag that accompanies each encoded value.
+///
+/// `Unknown` is returned for `NULL` values, which carry no type information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnType {
+    Boolean,
+    Byte,
+    Short,
+    Int,
+    Long,
+    Float,
+    Double,
+    Char,
+    String,
+    Uuid,
+    Date,
+    Timestamp,
+    Time,
+    Decimal,
+    Binary,
+    /// Could not be determined (all rows were NULL, or no rows returned).
+    Unknown,
+}
+
+impl ColumnType {
+    /// Return the canonical SQL type name for this column type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ColumnType::Boolean => "BOOLEAN",
+            ColumnType::Byte => "TINYINT",
+            ColumnType::Short => "SMALLINT",
+            ColumnType::Int => "INT",
+            ColumnType::Long => "BIGINT",
+            ColumnType::Float => "FLOAT",
+            ColumnType::Double => "DOUBLE",
+            ColumnType::Char => "CHAR",
+            ColumnType::String => "VARCHAR",
+            ColumnType::Uuid => "UUID",
+            ColumnType::Date => "DATE",
+            ColumnType::Timestamp => "TIMESTAMP",
+            ColumnType::Time => "TIME",
+            ColumnType::Decimal => "DECIMAL",
+            ColumnType::Binary => "BINARY",
+            ColumnType::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+impl fmt::Display for ColumnType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&IgniteValue> for ColumnType {
+    fn from(v: &IgniteValue) -> Self {
+        match v {
+            IgniteValue::Null => ColumnType::Unknown,
+            IgniteValue::Bool(_) => ColumnType::Boolean,
+            IgniteValue::Byte(_) => ColumnType::Byte,
+            IgniteValue::Short(_) => ColumnType::Short,
+            IgniteValue::Int(_) => ColumnType::Int,
+            IgniteValue::Long(_) => ColumnType::Long,
+            IgniteValue::Float(_) => ColumnType::Float,
+            IgniteValue::Double(_) => ColumnType::Double,
+            IgniteValue::Char(_) => ColumnType::Char,
+            IgniteValue::String(_) => ColumnType::String,
+            IgniteValue::Uuid(_) => ColumnType::Uuid,
+            IgniteValue::Date(_) => ColumnType::Date,
+            IgniteValue::Timestamp(_, _) => ColumnType::Timestamp,
+            IgniteValue::Time(_) => ColumnType::Time,
+            IgniteValue::Decimal(_) => ColumnType::Decimal,
+            IgniteValue::ByteArray(_) | IgniteValue::RawObject(_) => ColumnType::Binary,
+        }
+    }
+}
+
+impl IgniteValue {
+    /// Returns the [`ColumnType`] for this value, derived directly from its
+    /// 1-byte wire type-tag.
+    ///
+    /// This is the **reliable** way to determine a column's SQL type: because
+    /// `OP_QUERY_SQL_FIELDS` embeds a type code with every encoded value, the
+    /// type is always determinable at the value level regardless of schema
+    /// metadata.  The only case that returns [`ColumnType::Unknown`] is
+    /// [`IgniteValue::Null`], which carries no type information by definition.
+    pub fn column_type(&self) -> ColumnType {
+        ColumnType::from(self)
+    }
+}
+
 // ─── Java hash ────────────────────────────────────────────────────────────────
 
 /// Replicates Java's `String.hashCode()`.  Used to compute type IDs and field IDs
@@ -158,9 +258,8 @@ pub enum IgniteValue {
 /// assert_eq!(java_hash(""), 0);
 /// ```
 pub fn java_hash(s: &str) -> i32 {
-    s.chars().fold(0i32, |h, c| {
-        h.wrapping_mul(31).wrapping_add(c as i32)
-    })
+    s.chars()
+        .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(c as i32))
 }
 
 /// Cache ID is the Java hash of the upper-cased cache name.

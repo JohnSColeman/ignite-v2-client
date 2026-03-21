@@ -1,15 +1,16 @@
-
 //! End-to-end smoke tests against a live Apache Ignite 2.x node.
 //!
 //! Prerequisites: Ignite running on localhost:10800 with no authentication.
 //! Run:  cargo test --test smoke -- --nocapture
 
 use bigdecimal::BigDecimal;
-use ignite_client::{IgniteClient, IgniteClientConfig, IgniteError, IgniteValue, TxConcurrency, TxIsolation};
+use ignite_client::IgniteCache;
 use ignite_client::ProtocolError;
+use ignite_client::{
+    IgniteClient, IgniteClientConfig, IgniteError, IgniteValue, TxConcurrency, TxIsolation,
+};
 use std::str::FromStr;
 use uuid::Uuid;
-use ignite_client::IgniteCache;
 
 const ADDR: &str = "localhost:10800";
 
@@ -24,9 +25,7 @@ async fn create_table(c: &IgniteClient, name: &str, cols: &str) {
         .execute(&format!("DROP TABLE IF EXISTS PUBLIC.{name}"), vec![])
         .await;
     c.execute(
-        &format!(
-            "CREATE TABLE PUBLIC.{name} ({cols}) WITH \"template=replicated\""
-        ),
+        &format!("CREATE TABLE PUBLIC.{name} ({cols}) WITH \"template=replicated\""),
         vec![],
     )
     .await
@@ -42,9 +41,7 @@ async fn create_tx_table(c: &IgniteClient, name: &str, cols: &str) {
         .execute(&format!("DROP TABLE IF EXISTS PUBLIC.{name}"), vec![])
         .await;
     c.execute(
-        &format!(
-            "CREATE TABLE PUBLIC.{name} ({cols}) WITH \"ATOMICITY=TRANSACTIONAL\""
-        ),
+        &format!("CREATE TABLE PUBLIC.{name} ({cols}) WITH \"ATOMICITY=TRANSACTIONAL\""),
         vec![],
     )
     .await
@@ -78,7 +75,12 @@ async fn smoke_connect() {
 #[tokio::test]
 async fn smoke_crud() {
     let c = client();
-    create_table(&c, "SMOKE_CRUD", "id INT PRIMARY KEY, name VARCHAR, val BIGINT").await;
+    create_table(
+        &c,
+        "SMOKE_CRUD",
+        "id INT PRIMARY KEY, name VARCHAR, val BIGINT",
+    )
+    .await;
 
     // INSERT
     let ins = c
@@ -279,7 +281,10 @@ async fn smoke_tx_commit() {
     let c = client();
     create_tx_table(&c, "SMOKE_TX_COMMIT", "id INT PRIMARY KEY, v INT").await;
 
-    let mut tx = c.begin_transaction().await.expect("begin_transaction failed");
+    let mut tx = c
+        .begin_transaction()
+        .await
+        .expect("begin_transaction failed");
     tx.execute(
         "INSERT INTO PUBLIC.SMOKE_TX_COMMIT (id, v) VALUES (?, ?)",
         vec![IgniteValue::Int(1), IgniteValue::Int(100)],
@@ -311,7 +316,10 @@ async fn smoke_tx_rollback() {
     let c = client();
     create_tx_table(&c, "SMOKE_TX_ROLLBACK", "id INT PRIMARY KEY, v INT").await;
 
-    let mut tx = c.begin_transaction().await.expect("begin_transaction failed");
+    let mut tx = c
+        .begin_transaction()
+        .await
+        .expect("begin_transaction failed");
     tx.execute(
         "INSERT INTO PUBLIC.SMOKE_TX_ROLLBACK (id, v) VALUES (?, ?)",
         vec![IgniteValue::Int(1), IgniteValue::Int(999)],
@@ -377,7 +385,10 @@ async fn smoke_tx_drop_rollback() {
     create_tx_table(&c, "SMOKE_TX_DROP", "id INT PRIMARY KEY, v INT").await;
 
     {
-        let mut tx = c.begin_transaction().await.expect("begin_transaction failed");
+        let mut tx = c
+            .begin_transaction()
+            .await
+            .expect("begin_transaction failed");
         tx.execute(
             "INSERT INTO PUBLIC.SMOKE_TX_DROP (id, v) VALUES (?, ?)",
             vec![IgniteValue::Int(1), IgniteValue::Int(55)],
@@ -452,7 +463,11 @@ async fn smoke_get_by_name() {
         Some(&IgniteValue::String("bob".into())),
         "lowercase name lookup"
     );
-    assert_eq!(row.get_by_name("id"), Some(&IgniteValue::Int(1)), "id by name");
+    assert_eq!(
+        row.get_by_name("id"),
+        Some(&IgniteValue::Int(1)),
+        "id by name"
+    );
     assert_eq!(row.get_by_name("missing_col"), None, "absent column");
 
     drop_table(&c, "SMOKE_NAMES").await;
@@ -492,7 +507,10 @@ async fn smoke_tx_query() {
     .await
     .expect("INSERT failed");
 
-    let mut tx = c.begin_transaction().await.expect("begin_transaction failed");
+    let mut tx = c
+        .begin_transaction()
+        .await
+        .expect("begin_transaction failed");
     let r = tx
         .query(
             "SELECT v FROM PUBLIC.SMOKE_TX_QUERY WHERE id = ?",
@@ -578,7 +596,11 @@ async fn smoke_begin_transaction_with() {
     // parameter, but keep it large enough (30s) not to expire during a normal
     // test run even when many tests execute concurrently.
     let mut tx2 = c
-        .begin_transaction_with(TxConcurrency::Pessimistic, TxIsolation::ReadCommitted, 30_000)
+        .begin_transaction_with(
+            TxConcurrency::Pessimistic,
+            TxIsolation::ReadCommitted,
+            30_000,
+        )
         .await
         .expect("begin_transaction_with Pessimistic/ReadCommitted failed");
     tx2.execute(
@@ -607,7 +629,12 @@ async fn smoke_begin_transaction_with() {
 #[tokio::test]
 async fn smoke_row_introspection() {
     let c = client();
-    create_table(&c, "SMOKE_ROW_API", "id INT PRIMARY KEY, name VARCHAR, val BIGINT").await;
+    create_table(
+        &c,
+        "SMOKE_ROW_API",
+        "id INT PRIMARY KEY, name VARCHAR, val BIGINT",
+    )
+    .await;
 
     c.execute(
         "INSERT INTO PUBLIC.SMOKE_ROW_API (id, name, val) VALUES (?, ?, ?)",
@@ -662,7 +689,10 @@ async fn smoke_row_introspection() {
 async fn smoke_pool_status() {
     // Verify with_pool_size sets the field
     let config = IgniteClientConfig::new(ADDR).with_pool_size(3);
-    assert_eq!(config.max_pool_size, 3, "with_pool_size should set max_pool_size");
+    assert_eq!(
+        config.max_pool_size, 3,
+        "with_pool_size should set max_pool_size"
+    );
 
     // Verify pool_status reflects the configured size
     let c = IgniteClient::new(config);
@@ -672,16 +702,30 @@ async fn smoke_pool_status() {
     // Issue a query to create at least one connection
     c.query("SELECT 1", vec![]).await.expect("SELECT 1 failed");
     let status = c.pool_status();
-    assert!(status.size >= 1, "pool should have at least one live connection after a query");
+    assert!(
+        status.size >= 1,
+        "pool should have at least one live connection after a query"
+    );
 
     // Verify default pool size
     let default_config = IgniteClientConfig::new(ADDR);
-    assert_eq!(default_config.max_pool_size, 10, "default max_pool_size should be 10");
+    assert_eq!(
+        default_config.max_pool_size, 10,
+        "default max_pool_size should be 10"
+    );
 
     // Verify with_auth builder sets credentials (no server call needed)
     let authed = IgniteClientConfig::new(ADDR).with_auth("ignite", "ignite");
-    assert_eq!(authed.username, Some("ignite".to_string()), "with_auth username");
-    assert_eq!(authed.password, Some("ignite".to_string()), "with_auth password");
+    assert_eq!(
+        authed.username,
+        Some("ignite".to_string()),
+        "with_auth username"
+    );
+    assert_eq!(
+        authed.password,
+        Some("ignite".to_string()),
+        "with_auth password"
+    );
 }
 
 // ─── 17. Numeric narrow types: Byte, Short, Float ────────────────────────────
@@ -724,9 +768,21 @@ async fn smoke_types_numeric_narrow() {
         .await
         .expect("SELECT failed");
     let row = r.first_row().unwrap();
-    assert_eq!(row.get(0), Some(&IgniteValue::Byte(i8::MAX)), "Byte roundtrip");
-    assert_eq!(row.get(1), Some(&IgniteValue::Short(i16::MIN)), "Short roundtrip");
-    assert_eq!(row.get(2), Some(&IgniteValue::Float(3.14_f32)), "Float roundtrip");
+    assert_eq!(
+        row.get(0),
+        Some(&IgniteValue::Byte(i8::MAX)),
+        "Byte roundtrip"
+    );
+    assert_eq!(
+        row.get(1),
+        Some(&IgniteValue::Short(i16::MIN)),
+        "Short roundtrip"
+    );
+    assert_eq!(
+        row.get(2),
+        Some(&IgniteValue::Float(3.14_f32)),
+        "Float roundtrip"
+    );
 
     let r_null = c
         .query(
@@ -747,13 +803,12 @@ async fn smoke_types_numeric_narrow() {
 // ─── 18. Temporal types: Date, Time, Timestamp ───────────────────────────────
 
 /// Tests that IgniteValue::Date / Time / Timestamp are accepted as SQL
-/// parameters for INSERT and WHERE clauses.
+/// parameters for INSERT and WHERE clauses, and that SELECTing those columns
+/// round-trips correctly.
 ///
-/// Note: SELECTing DATE/TIME/TIMESTAMP column values directly returns type
-/// code 254 (OPTM_MARSH — Ignite wraps them as Java-serialised
-/// java.sql.Date/Time/Timestamp), which this client intentionally does not
-/// decode.  The encoding path (Rust → server) is fully exercised here; the
-/// decoding path (server → Rust) for temporal columns is a known gap.
+/// Ignite returns DATE/TIME/TIMESTAMP column values with type code 0xFE
+/// (OPTM_MARSH — Java-serialised java.sql.Date/Time/Timestamp).  The codec
+/// decodes these back to IgniteValue::Date/Time/Timestamp.
 #[tokio::test]
 async fn smoke_types_temporal() {
     let c = client();
@@ -804,7 +859,50 @@ async fn smoke_types_temporal() {
         )
         .await
         .expect("SELECT WHERE temporal failed");
-    assert_eq!(r2.row_count(), 1, "temporal WHERE clause should match stored row");
+    assert_eq!(
+        r2.row_count(),
+        1,
+        "temporal WHERE clause should match stored row"
+    );
+
+    // Select the temporal column values back and verify they decode correctly.
+    //
+    // DATE  — returned with type code 0xFE (OPTM_MARSH, Ignite OptimizedMarshaller
+    //          for java.sql.Date).  Decoded back to IgniteValue::Date(ms).
+    //
+    // TIME  — returned with native type code 36 (not OPTM_MARSH).  Ignite's binary
+    //          TIME stores an i64 in milliseconds.  Our parameter was sent as
+    //          time_ns (nanoseconds) which Ignite interpreted as milliseconds and
+    //          then normalised modulo 86_400_000 (one day in ms).
+    //
+    // TIMESTAMP — returned with native type code 33.  Round-trips exactly.
+    let r3 = c
+        .query(
+            "SELECT dv, tv, tsv FROM PUBLIC.SMOKE_TEMPORAL WHERE id = 1",
+            vec![],
+        )
+        .await
+        .expect("SELECT temporal columns failed");
+    let row = r3.first_row().expect("should have a row");
+    assert_eq!(
+        row.get(0),
+        Some(&IgniteValue::Date(date_ms)),
+        "DATE column should decode via OPTM_MARSH to IgniteValue::Date"
+    );
+    // TIME: Ignite binary TIME stores a raw i64 which it treats as milliseconds.
+    // The nanosecond value we sent (time_ns) was therefore interpreted as ms
+    // by Ignite, which normalised it to time_ns % 86_400_000 (one day in ms).
+    let expected_time_ms = time_ns % 86_400_000;
+    assert_eq!(
+        row.get(1),
+        Some(&IgniteValue::Time(expected_time_ms)),
+        "TIME column should decode as native ms value"
+    );
+    assert_eq!(
+        row.get(2),
+        Some(&IgniteValue::Timestamp(ts_ms, 0)),
+        "TIMESTAMP column should round-trip correctly"
+    );
 
     // NULL temporal columns: verify via IS NULL rather than reading column value
     c.execute(
@@ -991,10 +1089,7 @@ async fn smoke_query_stream() {
 
     // ── Non-transactional stream ──────────────────────────────────────────────
     let stream: QueryStream = c
-        .query_stream(
-            "SELECT id, v FROM PUBLIC.SMOKE_STREAM ORDER BY id",
-            vec![],
-        )
+        .query_stream("SELECT id, v FROM PUBLIC.SMOKE_STREAM ORDER BY id", vec![])
         .await
         .expect("query_stream failed");
 
@@ -1003,10 +1098,7 @@ async fn smoke_query_stream() {
     assert_eq!(stream.columns[0].name, "ID");
     assert_eq!(stream.columns[1].name, "V");
 
-    let rows: Vec<_> = stream
-        .map(|r| r.expect("stream row error"))
-        .collect()
-        .await;
+    let rows: Vec<_> = stream.map(|r| r.expect("stream row error")).collect().await;
 
     assert_eq!(rows.len(), 5, "expected 5 rows from stream");
     for (i, row) in rows.iter().enumerate() {
@@ -1024,13 +1116,13 @@ async fn smoke_query_stream() {
     }
 
     // ── Transactional stream ──────────────────────────────────────────────────
-    let mut tx = c.begin_transaction().await.expect("begin_transaction failed");
+    let mut tx = c
+        .begin_transaction()
+        .await
+        .expect("begin_transaction failed");
 
     let tx_stream = tx
-        .query_stream(
-            "SELECT id FROM PUBLIC.SMOKE_STREAM ORDER BY id",
-            vec![],
-        )
+        .query_stream("SELECT id FROM PUBLIC.SMOKE_STREAM ORDER BY id", vec![])
         .await
         .expect("tx.query_stream failed");
 
@@ -1062,7 +1154,10 @@ async fn smoke_cache_basic() {
 
     // Miss before any put
     assert_eq!(
-        cache.get(IgniteValue::Int(1)).await.expect("get miss failed"),
+        cache
+            .get(IgniteValue::Int(1))
+            .await
+            .expect("get miss failed"),
         IgniteValue::Null,
         "expected Null for absent key"
     );
@@ -1081,7 +1176,10 @@ async fn smoke_cache_basic() {
         .expect("put failed");
 
     assert_eq!(
-        cache.get(IgniteValue::Int(1)).await.expect("get hit failed"),
+        cache
+            .get(IgniteValue::Int(1))
+            .await
+            .expect("get hit failed"),
         IgniteValue::String("hello".into()),
         "get after put"
     );
@@ -1100,7 +1198,10 @@ async fn smoke_cache_basic() {
         .expect("remove failed");
 
     assert_eq!(
-        cache.get(IgniteValue::Int(1)).await.expect("get after remove failed"),
+        cache
+            .get(IgniteValue::Int(1))
+            .await
+            .expect("get after remove failed"),
         IgniteValue::Null,
         "key should be absent after remove"
     );
@@ -1151,18 +1252,31 @@ async fn smoke_cache_bulk() {
 
     // get_all with one absent key — absent key is omitted
     let mixed_keys = vec![IgniteValue::Int(2), IgniteValue::Int(99)];
-    let partial = cache.get_all(mixed_keys).await.expect("get_all partial failed");
+    let partial = cache
+        .get_all(mixed_keys)
+        .await
+        .expect("get_all partial failed");
     assert_eq!(partial.len(), 1, "get_all should omit absent keys");
     assert_eq!(partial[0].0, IgniteValue::Int(2), "partial key");
     assert_eq!(partial[0].1, IgniteValue::Int(200), "partial value");
 
     // remove_all
     let remove_keys: Vec<IgniteValue> = (1i32..=3).map(IgniteValue::Int).collect();
-    cache.remove_all(remove_keys).await.expect("remove_all failed");
+    cache
+        .remove_all(remove_keys)
+        .await
+        .expect("remove_all failed");
 
     let remaining_keys: Vec<IgniteValue> = (1i32..=5).map(IgniteValue::Int).collect();
-    let remaining = cache.get_all(remaining_keys).await.expect("get_all after remove_all failed");
-    assert_eq!(remaining.len(), 2, "expected 2 remaining entries after remove_all");
+    let remaining = cache
+        .get_all(remaining_keys)
+        .await
+        .expect("get_all after remove_all failed");
+    assert_eq!(
+        remaining.len(),
+        2,
+        "expected 2 remaining entries after remove_all"
+    );
 
     c.destroy_cache("SMOKE_CACHE_BULK")
         .await
@@ -1186,7 +1300,10 @@ async fn smoke_cache_replace() {
         .replace(IgniteValue::Int(42), IgniteValue::String("nope".into()))
         .await
         .expect("replace absent failed");
-    assert!(!replaced_absent, "replace on absent key should return false");
+    assert!(
+        !replaced_absent,
+        "replace on absent key should return false"
+    );
     assert_eq!(
         cache.get(IgniteValue::Int(42)).await.unwrap(),
         IgniteValue::Null,
@@ -1202,7 +1319,10 @@ async fn smoke_cache_replace() {
         .replace(IgniteValue::Int(42), IgniteValue::String("updated".into()))
         .await
         .expect("replace present failed");
-    assert!(replaced_present, "replace on existing key should return true");
+    assert!(
+        replaced_present,
+        "replace on existing key should return true"
+    );
     assert_eq!(
         cache.get(IgniteValue::Int(42)).await.unwrap(),
         IgniteValue::String("updated".into()),
@@ -1231,7 +1351,11 @@ async fn smoke_cache_get_and() {
         .get_and_put(IgniteValue::Int(7), IgniteValue::Long(100))
         .await
         .expect("get_and_put absent failed");
-    assert_eq!(old, IgniteValue::Null, "get_and_put on absent key should return Null");
+    assert_eq!(
+        old,
+        IgniteValue::Null,
+        "get_and_put on absent key should return Null"
+    );
     assert_eq!(
         cache.get(IgniteValue::Int(7)).await.unwrap(),
         IgniteValue::Long(100),
@@ -1243,7 +1367,11 @@ async fn smoke_cache_get_and() {
         .get_and_put(IgniteValue::Int(7), IgniteValue::Long(200))
         .await
         .expect("get_and_put present failed");
-    assert_eq!(old2, IgniteValue::Long(100), "get_and_put should return previous value");
+    assert_eq!(
+        old2,
+        IgniteValue::Long(100),
+        "get_and_put should return previous value"
+    );
     assert_eq!(
         cache.get(IgniteValue::Int(7)).await.unwrap(),
         IgniteValue::Long(200),
@@ -1255,7 +1383,11 @@ async fn smoke_cache_get_and() {
         .get_and_remove(IgniteValue::Int(7))
         .await
         .expect("get_and_remove present failed");
-    assert_eq!(removed_val, IgniteValue::Long(200), "get_and_remove should return the value");
+    assert_eq!(
+        removed_val,
+        IgniteValue::Long(200),
+        "get_and_remove should return the value"
+    );
     assert_eq!(
         cache.get(IgniteValue::Int(7)).await.unwrap(),
         IgniteValue::Null,
@@ -1267,7 +1399,11 @@ async fn smoke_cache_get_and() {
         .get_and_remove(IgniteValue::Int(99))
         .await
         .expect("get_and_remove absent failed");
-    assert_eq!(removed_absent, IgniteValue::Null, "get_and_remove absent key should return Null");
+    assert_eq!(
+        removed_absent,
+        IgniteValue::Null,
+        "get_and_remove absent key should return Null"
+    );
 
     c.destroy_cache("SMOKE_CACHE_GET_AND")
         .await
@@ -1281,7 +1417,10 @@ async fn smoke_cache_get_and() {
 async fn smoke_cache_put_if_absent() {
     let c = client();
     let _ = c.destroy_cache("SMOKE_PIA").await;
-    let cache = c.get_or_create_cache("SMOKE_PIA").await.expect("get_or_create_cache failed");
+    let cache = c
+        .get_or_create_cache("SMOKE_PIA")
+        .await
+        .expect("get_or_create_cache failed");
 
     // Absent key → stored, returns true
     let stored = cache
@@ -1300,14 +1439,19 @@ async fn smoke_cache_put_if_absent() {
         .put_if_absent(IgniteValue::Int(1), IgniteValue::String("second".into()))
         .await
         .expect("put_if_absent present failed");
-    assert!(!stored_again, "put_if_absent on present key should return false");
+    assert!(
+        !stored_again,
+        "put_if_absent on present key should return false"
+    );
     assert_eq!(
         cache.get(IgniteValue::Int(1)).await.unwrap(),
         IgniteValue::String("first".into()),
         "existing value must not be overwritten by put_if_absent"
     );
 
-    c.destroy_cache("SMOKE_PIA").await.expect("destroy_cache failed");
+    c.destroy_cache("SMOKE_PIA")
+        .await
+        .expect("destroy_cache failed");
 }
 
 // ─── 27. KV cache — get_and_replace ──────────────────────────────────────────
@@ -1318,14 +1462,21 @@ async fn smoke_cache_put_if_absent() {
 async fn smoke_cache_get_and_replace() {
     let c = client();
     let _ = c.destroy_cache("SMOKE_GAR").await;
-    let cache = c.get_or_create_cache("SMOKE_GAR").await.expect("get_or_create_cache failed");
+    let cache = c
+        .get_or_create_cache("SMOKE_GAR")
+        .await
+        .expect("get_or_create_cache failed");
 
     // Absent key → Null returned, no insert
     let old_absent = cache
         .get_and_replace(IgniteValue::Int(5), IgniteValue::String("value".into()))
         .await
         .expect("get_and_replace absent failed");
-    assert_eq!(old_absent, IgniteValue::Null, "get_and_replace on absent key should return Null");
+    assert_eq!(
+        old_absent,
+        IgniteValue::Null,
+        "get_and_replace on absent key should return Null"
+    );
     assert_eq!(
         cache.get(IgniteValue::Int(5)).await.unwrap(),
         IgniteValue::Null,
@@ -1352,7 +1503,9 @@ async fn smoke_cache_get_and_replace() {
         "get_and_replace should store the new value"
     );
 
-    c.destroy_cache("SMOKE_GAR").await.expect("destroy_cache failed");
+    c.destroy_cache("SMOKE_GAR")
+        .await
+        .expect("destroy_cache failed");
 }
 
 // ─── 28. KV cache — get_size ──────────────────────────────────────────────────
@@ -1362,24 +1515,53 @@ async fn smoke_cache_get_and_replace() {
 async fn smoke_cache_size() {
     let c = client();
     let _ = c.destroy_cache("SMOKE_SIZE").await;
-    let cache = c.get_or_create_cache("SMOKE_SIZE").await.expect("get_or_create_cache failed");
+    let cache = c
+        .get_or_create_cache("SMOKE_SIZE")
+        .await
+        .expect("get_or_create_cache failed");
 
     // Empty cache
-    assert_eq!(cache.get_size().await.expect("get_size empty failed"), 0, "empty cache size");
+    assert_eq!(
+        cache.get_size().await.expect("get_size empty failed"),
+        0,
+        "empty cache size"
+    );
 
     // After put_all
     let entries: Vec<(IgniteValue, IgniteValue)> = (1i32..=5)
         .map(|i| (IgniteValue::Int(i), IgniteValue::Long(i as i64 * 10)))
         .collect();
     cache.put_all(entries).await.expect("put_all failed");
-    assert_eq!(cache.get_size().await.expect("get_size after put_all failed"), 5, "size after 5 puts");
+    assert_eq!(
+        cache
+            .get_size()
+            .await
+            .expect("get_size after put_all failed"),
+        5,
+        "size after 5 puts"
+    );
 
     // After removing 2 keys
-    cache.remove(IgniteValue::Int(1)).await.expect("remove 1 failed");
-    cache.remove(IgniteValue::Int(2)).await.expect("remove 2 failed");
-    assert_eq!(cache.get_size().await.expect("get_size after removes failed"), 3, "size after 2 removes");
+    cache
+        .remove(IgniteValue::Int(1))
+        .await
+        .expect("remove 1 failed");
+    cache
+        .remove(IgniteValue::Int(2))
+        .await
+        .expect("remove 2 failed");
+    assert_eq!(
+        cache
+            .get_size()
+            .await
+            .expect("get_size after removes failed"),
+        3,
+        "size after 2 removes"
+    );
 
-    c.destroy_cache("SMOKE_SIZE").await.expect("destroy_cache failed");
+    c.destroy_cache("SMOKE_SIZE")
+        .await
+        .expect("destroy_cache failed");
 }
 
 // ─── 29. Cache discovery — cache_names ───────────────────────────────────────
@@ -1392,8 +1574,12 @@ async fn smoke_cache_names() {
     let _ = c.destroy_cache("SMOKE_NAMES_A").await;
     let _ = c.destroy_cache("SMOKE_NAMES_B").await;
 
-    c.get_or_create_cache("SMOKE_NAMES_A").await.expect("create NAMES_A failed");
-    c.get_or_create_cache("SMOKE_NAMES_B").await.expect("create NAMES_B failed");
+    c.get_or_create_cache("SMOKE_NAMES_A")
+        .await
+        .expect("create NAMES_A failed");
+    c.get_or_create_cache("SMOKE_NAMES_B")
+        .await
+        .expect("create NAMES_B failed");
 
     let names = c.cache_names().await.expect("cache_names failed");
     assert!(
@@ -1406,14 +1592,21 @@ async fn smoke_cache_names() {
     );
 
     // After destroy, name disappears
-    c.destroy_cache("SMOKE_NAMES_B").await.expect("destroy NAMES_B failed");
-    let names_after = c.cache_names().await.expect("cache_names after destroy failed");
+    c.destroy_cache("SMOKE_NAMES_B")
+        .await
+        .expect("destroy NAMES_B failed");
+    let names_after = c
+        .cache_names()
+        .await
+        .expect("cache_names after destroy failed");
     assert!(
         !names_after.iter().any(|n| n == "SMOKE_NAMES_B"),
         "cache_names should not include SMOKE_NAMES_B after destroy; got: {names_after:?}"
     );
 
-    c.destroy_cache("SMOKE_NAMES_A").await.expect("destroy NAMES_A failed");
+    c.destroy_cache("SMOKE_NAMES_A")
+        .await
+        .expect("destroy NAMES_A failed");
 }
 
 // ─── 30. Transactional KV — commit ───────────────────────────────────────────
@@ -1428,7 +1621,10 @@ async fn smoke_tx_kv_commit() {
         .await
         .expect("create transactional cache failed");
 
-    let tx = c.begin_transaction().await.expect("begin_transaction failed");
+    let tx = c
+        .begin_transaction()
+        .await
+        .expect("begin_transaction failed");
     tx.cache("SMOKE_TX_KV_COMMIT")
         .put(IgniteValue::Int(1), IgniteValue::String("alpha".into()))
         .await
@@ -1452,7 +1648,9 @@ async fn smoke_tx_kv_commit() {
         "key 2 should be committed"
     );
 
-    c.destroy_cache("SMOKE_TX_KV_COMMIT").await.expect("destroy failed");
+    c.destroy_cache("SMOKE_TX_KV_COMMIT")
+        .await
+        .expect("destroy failed");
 }
 
 // ─── 31. Transactional KV — within-tx read + rollback ────────────────────────
@@ -1469,7 +1667,10 @@ async fn smoke_tx_kv_rollback() {
         .await
         .expect("create transactional cache failed");
 
-    let tx = c.begin_transaction().await.expect("begin_transaction failed");
+    let tx = c
+        .begin_transaction()
+        .await
+        .expect("begin_transaction failed");
 
     // Write inside the transaction
     tx.cache("SMOKE_TX_KV_ROLLBACK")
@@ -1510,7 +1711,9 @@ async fn smoke_tx_kv_rollback() {
     }
     // Either Null (TRANSACTIONAL) or the written value (ATOMIC) is acceptable.
 
-    c.destroy_cache("SMOKE_TX_KV_ROLLBACK").await.expect("destroy failed");
+    c.destroy_cache("SMOKE_TX_KV_ROLLBACK")
+        .await
+        .expect("destroy failed");
 }
 
 // ─── P3: Configurable page size ───────────────────────────────────────────────
@@ -1550,14 +1753,20 @@ async fn smoke_tls_config_builds() {
     // Plain TLS config — fields are set correctly
     let plain_tls = IgniteClientConfig::new(ADDR).with_tls();
     assert!(plain_tls.use_tls, "with_tls() should set use_tls=true");
-    assert!(!plain_tls.tls_accept_invalid_certs, "tls_accept_invalid_certs should default to false");
+    assert!(
+        !plain_tls.tls_accept_invalid_certs,
+        "tls_accept_invalid_certs should default to false"
+    );
 
     // Dev config — both flags set
     let dev_tls = IgniteClientConfig::new(ADDR)
         .with_tls()
         .with_tls_accept_invalid_certs();
     assert!(dev_tls.use_tls, "with_tls() should set use_tls=true");
-    assert!(dev_tls.tls_accept_invalid_certs, "with_tls_accept_invalid_certs() should set flag");
+    assert!(
+        dev_tls.tls_accept_invalid_certs,
+        "with_tls_accept_invalid_certs() should set flag"
+    );
 
     // Default config — TLS disabled
     let no_tls = IgniteClientConfig::new(ADDR);
@@ -1617,7 +1826,10 @@ async fn smoke_query_stream_early_drop() {
 
     // Open stream, take only 5, collect — the rest are dropped mid-iteration.
     let stream = c
-        .query_stream("SELECT id FROM PUBLIC.STREAM_EARLY_DROP ORDER BY id", vec![])
+        .query_stream(
+            "SELECT id FROM PUBLIC.STREAM_EARLY_DROP ORDER BY id",
+            vec![],
+        )
         .await
         .expect("query_stream failed");
 

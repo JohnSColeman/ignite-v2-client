@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use futures::{SinkExt, StreamExt};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, warn};
 
@@ -27,14 +27,15 @@ pub fn next_request_id() -> i64 {
 
 // ─── Pending map type ─────────────────────────────────────────────────────────
 
-type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<std::result::Result<Bytes, TransportError>>>>>;
+type PendingMap =
+    Arc<Mutex<HashMap<i64, oneshot::Sender<std::result::Result<Bytes, TransportError>>>>>;
 
 // ─── Writer / Reader type aliases ─────────────────────────────────────────────
 
 /// Type-erased async write half — works for both plain TCP and TLS streams.
 type AnyWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 /// Type-erased async read half — works for both plain TCP and TLS streams.
-type AnyRead  = Box<dyn tokio::io::AsyncRead  + Unpin + Send>;
+type AnyRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 
 type Writer = FramedWrite<AnyWrite, LengthDelimitedCodec>;
 
@@ -172,19 +173,18 @@ impl IgniteConnection {
         };
 
         let mut framed_write = FramedWrite::new(any_write, build_codec());
-        let mut framed_read  = FramedRead::new(any_read,  build_codec());
+        let mut framed_read = FramedRead::new(any_read, build_codec());
 
         // ── Handshake ─────────────────────────────────────────────────────────
         let hs_payload = handshake.encode();
         framed_write.send(hs_payload).await?;
 
-        let hs_frame = framed_read
-            .next()
-            .await
-            .ok_or_else(|| TransportError::Io(std::io::Error::new(
+        let hs_frame = framed_read.next().await.ok_or_else(|| {
+            TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "connection closed during handshake",
-            )))??;
+            ))
+        })??;
 
         let mut hs_bytes = hs_frame.freeze();
         crate::protocol::handshake::HandshakeResponse::decode(&mut hs_bytes)
@@ -229,16 +229,19 @@ impl IgniteConnection {
                         // Minimum valid response: i64 req_id + i16 flags = 10 bytes.
                         // (old guard of 12 was wrong for protocol 1.7 body-less replies)
                         if bytes.remaining() < 10 {
-                            warn!("received undersized frame ({} bytes), skipping", bytes.remaining());
+                            warn!(
+                                "received undersized frame ({} bytes), skipping",
+                                bytes.remaining()
+                            );
                             continue;
                         }
                         // Peek request_id (first 8 bytes of response payload).
                         // Safety: the 10-byte size guard above guarantees bytes[0..8] exists.
                         #[allow(clippy::expect_used)]
-                        let req_id = i64::from_le_bytes(
-                            bytes[0..8].try_into()
-                                .expect("slice is 8 bytes: guaranteed by 10-byte size guard above"),
-                        );
+                        let req_id =
+                            i64::from_le_bytes(bytes[0..8].try_into().expect(
+                                "slice is 8 bytes: guaranteed by 10-byte size guard above",
+                            ));
                         let mut map = pending_reader.lock().await;
                         if let Some(tx) = map.remove(&req_id) {
                             let _ = tx.send(Ok(bytes));
@@ -255,7 +258,13 @@ impl IgniteConnection {
         // `abort()` — preventing a lingering zombie reader task.
         let reader_abort = Arc::new(AbortOnDrop(handle.abort_handle()));
 
-        Ok(Self { writer, pending, alive, request_timeout, reader_abort })
+        Ok(Self {
+            writer,
+            pending,
+            alive,
+            request_timeout,
+            reader_abort,
+        })
     }
 }
 
@@ -328,7 +337,8 @@ impl IgniteConnection {
                 }
             }
         } else {
-            rx.await.map_err(|_| TransportError::ConnectionClosed(request_id))?
+            rx.await
+                .map_err(|_| TransportError::ConnectionClosed(request_id))?
         }
     }
 

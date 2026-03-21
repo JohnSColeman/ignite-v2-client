@@ -2,18 +2,18 @@ use std::sync::Arc;
 
 use crate::protocol::handshake::HandshakeRequest;
 use crate::protocol::messages::{
-    decode_cache_names_response, decode_tx_start_response, encode_cache_create_with_config,
-    encode_cache_get_names, encode_tx_start, SqlFieldsRequest,
+    SqlFieldsRequest, decode_cache_names_response, decode_tx_start_response,
+    encode_cache_create_with_config, encode_cache_get_names, encode_tx_start,
 };
-use crate::protocol::{cache_id, op_code, IgniteValue, StatementType, TxConcurrency, TxIsolation};
-use crate::transport::{next_request_id, IgniteConnection};
+use crate::protocol::{IgniteValue, StatementType, TxConcurrency, TxIsolation, cache_id, op_code};
+use crate::transport::{IgniteConnection, next_request_id};
 
-use crate::cache::{destroy_cache_by_name, get_or_create_cache_by_name, IgniteCache};
+use crate::cache::{IgniteCache, destroy_cache_by_name, get_or_create_cache_by_name};
 use crate::error::{IgniteError, Result};
 use crate::pool::{self, IgniteClientConfig, Pool};
 use crate::query::{QueryResult, UpdateResult};
 use crate::stream::{self, QueryStream};
-use crate::transaction::{execute_sql_fields, extract_rows_affected, Transaction};
+use crate::transaction::{Transaction, execute_sql_fields, extract_rows_affected};
 
 /// The main Ignite client.  Wraps a connection pool; cheap to clone.
 #[derive(Clone)]
@@ -64,11 +64,7 @@ impl IgniteClient {
     /// The underlying connection is borrowed from the pool for the request and
     /// returned immediately; the stream holds a shared handle (clone) to the
     /// same TCP connection via the multiplexing design.
-    pub async fn query_stream(
-        &self,
-        sql: &str,
-        params: Vec<IgniteValue>,
-    ) -> Result<QueryStream> {
+    pub async fn query_stream(&self, sql: &str, params: Vec<IgniteValue>) -> Result<QueryStream> {
         use crate::protocol::messages::SqlFieldsFirstPage;
         use crate::protocol::op_code;
 
@@ -103,7 +99,9 @@ impl IgniteClient {
             ..SqlFieldsRequest::new(sql, params)
         };
         let result = execute_sql_fields(&conn_obj, req).await?;
-        Ok(UpdateResult { rows_affected: extract_rows_affected(&result) })
+        Ok(UpdateResult {
+            rows_affected: extract_rows_affected(&result),
+        })
     }
 
     /// Begin a new transaction with Pessimistic / ReadCommitted isolation (sensible default).
@@ -124,10 +122,7 @@ impl IgniteClient {
         timeout_ms: i64,
     ) -> Result<Transaction> {
         // Open a dedicated connection for this transaction
-        let hs = HandshakeRequest::new(
-            self.config.username.clone(),
-            self.config.password.clone(),
-        );
+        let hs = HandshakeRequest::new(self.config.username.clone(), self.config.password.clone());
         let tls = if self.config.use_tls {
             Some(
                 crate::transport::build_tls_config(self.config.tls_accept_invalid_certs)
@@ -161,10 +156,13 @@ impl IgniteClient {
             .await
             .map_err(IgniteError::Transport)?;
 
-        let tx_id = decode_tx_start_response(&mut response)
-            .map_err(IgniteError::Protocol)?;
+        let tx_id = decode_tx_start_response(&mut response).map_err(IgniteError::Protocol)?;
 
-        Ok(Transaction::new(tx_id, Arc::new(conn), self.config.page_size as i32))
+        Ok(Transaction::new(
+            tx_id,
+            Arc::new(conn),
+            self.config.page_size as i32,
+        ))
     }
 
     /// Convenience: run a closure in a transaction, committing on success.

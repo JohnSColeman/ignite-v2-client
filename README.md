@@ -12,12 +12,22 @@ over TCP.
 - [Protocol Reference](#protocol-reference)
 - [Project Structure](#project-structure)
 - [Quick Start](#quick-start)
+  - [SELECT query](#select-query)
+  - [Per-value type inspection](#per-value-type-inspection)
+  - [DML](#dml)
+  - [Transaction](#transaction-1)
+  - [Transaction helper (auto-commit/rollback)](#transaction-helper-auto-commitrollback)
+  - [KV cache](#kv-cache)
+  - [Streaming cursor](#streaming-cursor)
+  - [TLS](#tls)
+  - [Authentication](#authentication)
 - [API Reference](#api-reference)
   - [IgniteClientConfig](#igniteclientconfig)
   - [IgniteClient](#igniteclient)
   - [Transaction](#transaction)
   - [IgniteCache](#ignitecache)
   - [QueryResult / Row](#queryresult--row)
+  - [Column and ColumnType](#column-and-columntype)
   - [QueryStream](#querystream)
   - [IgniteValue type system](#ignitevalue-type-system)
 - [Architecture](#architecture)
@@ -94,12 +104,12 @@ ignite-client/
 │   ├── transaction.rs      ← Transaction: query, execute, commit, rollback, cache, drop
 │   ├── cache.rs            ← IgniteCache: get, put, get_all, put_all, remove, …
 │   ├── stream.rs           ← QueryStream: lazily-paged streaming cursor
-│   ├── query.rs            ← QueryResult, Row, Column, UpdateResult
+│   ├── query.rs            ← QueryResult, Row, Column, ColumnType, UpdateResult
 │   ├── pool.rs             ← IgniteClientConfig, deadpool manager
 │   ├── error.rs            ← IgniteError
 │   ├── protocol/           ← pure codec layer: no I/O, no async
 │   │   ├── mod.rs
-│   │   ├── types.rs        ← IgniteValue enum, op codes, type codes, tx enums
+│   │   ├── types.rs        ← IgniteValue enum + column_type(), ColumnType, op/type codes
 │   │   ├── codec.rs        ← encode_value / decode_value roundtrip
 │   │   ├── handshake.rs    ← protocol 1.7.0 handshake encoding
 │   │   ├── error.rs        ← ProtocolError
@@ -110,7 +120,11 @@ ignite-client/
 │       ├── error.rs        ← TransportError
 │       └── tls.rs          ← build_tls_config (rustls + native-certs)
 └── tests/
-    └── smoke.rs            ← 35 end-to-end integration tests
+    ├── smoke.rs            ← 39 broad end-to-end integration tests
+    ├── metadata.rs         ← 12 schema/system-view metadata tests
+    ├── functional_query.rs ←  6 SQL query behaviour tests (pagination, mixed KV+SQL, errors)
+    ├── functional_cache.rs ←  5 KV cache API lifecycle and operation tests
+    └── transaction.rs      ←  3 concurrent transaction correctness tests
 ```
 
 The `protocol` module has no I/O dependency, so its codec tests run without a
@@ -152,6 +166,56 @@ async fn main() -> anyhow::Result<()> {
         println!("{:?}  {:?}  {:?}", id, name, score);
     }
     Ok(())
+}
+```
+
+### Per-value type inspection
+
+`QueryResult::columns` exposes result-set column names.  The Ignite 2.x
+`OP_QUERY_SQL_FIELDS` protocol carries only column names in the first-page
+metadata — no per-column type codes.  Type information is available per value
+via `IgniteValue::column_type()`, which reads the 1-byte wire tag that
+accompanies every encoded value.  The only case that returns
+`ColumnType::Unknown` is `IgniteValue::Null`.
+
+```rust,ignore
+use ignite_client::{ColumnType, IgniteValue};
+
+let result = client
+    .query("SELECT id, name, score FROM PUBLIC.players WHERE id = 1", vec![])
+    .await?;
+
+if let Some(row) = result.first_row() {
+    for (i, col) in result.columns.iter().enumerate() {
+        let value = row.get(i).unwrap();
+        let value_t = value.column_type();   // always accurate for non-NULL values
+        println!("column '{}': type={:?}, value={:?}", col.name, value_t, value);
+    }
+}
+
+// Dispatch on value type while iterating rows.
+for row in &result.rows {
+    for value in row.values() {
+        match value.column_type() {
+            ColumnType::Int     => { /* handle i32 */ }
+            ColumnType::String  => { /* handle varchar */ }
+            ColumnType::Unknown => { /* value is NULL */ }
+            _                   => { /* other types */ }
+        }
+    }
+}
+```
+
+Column names are accessible immediately on a `QueryStream` before any rows are
+consumed:
+
+```rust,ignore
+let stream = client
+    .query_stream("SELECT id, name FROM PUBLIC.players", vec![])
+    .await?;
+
+for col in &stream.columns {
+    println!("{}", col.name);
 }
 ```
 
@@ -393,7 +457,7 @@ impl IgniteCache {
 
 ```rust,ignore
 pub struct QueryResult {
-    pub columns: Vec<Column>,
+    pub columns: Vec<Column>,  // result-set metadata; available before any row processing
     pub rows: Vec<Row>,
 }
 
@@ -414,6 +478,47 @@ impl Row {
 
 pub struct UpdateResult {
     pub rows_affected: i64,  // -1 if server did not return a count
+}
+```
+
+### Column and ColumnType
+
+```rust,ignore
+pub struct Column {
+    /// Column name as returned by the server (matches the SQL alias or field name).
+    pub name: String,
+}
+
+pub enum ColumnType {
+    Boolean,
+    Byte,       // TINYINT
+    Short,      // SMALLINT
+    Int,        // INT
+    Long,       // BIGINT
+    Float,      // REAL / FLOAT
+    Double,     // DOUBLE
+    Char,       // CHAR (single BMP code point)
+    String,     // VARCHAR
+    Uuid,       // UUID
+    Date,       // DATE
+    Timestamp,  // TIMESTAMP
+    Time,       // TIME
+    Decimal,    // DECIMAL / NUMERIC
+    Binary,     // BINARY / VARBINARY
+    Unknown,    // NULL value — type could not be determined
+}
+
+impl ColumnType {
+    /// Return the canonical SQL type name, e.g. `"INT"`, `"VARCHAR"`, `"TIMESTAMP"`.
+    pub fn as_str(&self) -> &'static str;
+}
+
+impl IgniteValue {
+    /// Derive the `ColumnType` from this value's own 1-byte wire type tag.
+    ///
+    /// Always accurate for non-NULL values.  Returns `ColumnType::Unknown`
+    /// only for `IgniteValue::Null` (a NULL carries no type tag in the protocol).
+    pub fn column_type(&self) -> ColumnType;
 }
 ```
 
@@ -631,30 +736,56 @@ Covers:
 - `SqlFieldsRequest` encode/decode
 - Transaction start/end encoding
 
-### Smoke tests (requires a live Ignite 2.x node on localhost:10800)
+### Integration tests (require a live Ignite 2.x node on localhost:10800)
 
-Start an Ignite node.  DML-in-transaction tests require the JVM flag and a
-TRANSACTIONAL-atomicity table (see `create_tx_table` in the test file):
+All integration test modules connect to `localhost:10800` with no
+authentication.  Start Ignite before running them.
+
+DML-inside-transaction tests (used by `smoke.rs` and `transaction.rs`) require
+the JVM system property that enables DML in thin-client transactions:
 
 ```bash
 # Linux / macOS
 IGNITE_HOME/bin/ignite.sh -DIGNITE_ALLOW_DML_INSIDE_TRANSACTION=true config.xml
 
-# Windows
+# Windows (example wrapper script)
 C:\ignite\run-ignite.bat
 ```
 
-Run all 35 smoke tests sequentially (parallel DDL causes schema lock contention):
+**Always run integration tests with `--test-threads=1`.**  Parallel DDL
+(CREATE / DROP TABLE) causes schema lock contention, and many concurrent
+connections from parallel tests can exhaust Ignite's handshake thread pool,
+producing `Unable to perform handshake within timeout` errors.
+
+Run all integration tests across all modules in one command:
 
 ```bash
-cargo test --test smoke -- --nocapture --test-threads 1
+cargo test --tests -- --nocapture --test-threads=1
 ```
 
-> **Windows note:** If Windows Smart App Control blocks newly compiled binaries,
-> build to AppData instead:
-> `CARGO_TARGET_DIR="$APPDATA/ignite-test-target" cargo test --test smoke -- --nocapture --test-threads 1`
+Or run individual modules:
 
-Smoke test coverage:
+```bash
+cargo test --test smoke          -- --nocapture --test-threads=1
+cargo test --test metadata       -- --nocapture --test-threads=1
+cargo test --test functional_query -- --nocapture --test-threads=1
+cargo test --test functional_cache -- --nocapture --test-threads=1
+cargo test --test transaction    -- --nocapture --test-threads=1
+```
+
+> **Windows note:** If Windows Smart App Control blocks newly compiled test
+> binaries, redirect the build output to AppData:
+> ```
+> set CARGO_TARGET_DIR=%APPDATA%\ignite-test-target
+> cargo test --tests -- --nocapture --test-threads=1
+> ```
+
+---
+
+### `tests/smoke.rs` — 39 tests
+
+Broad end-to-end coverage of every public API surface.  Tests are prefixed
+`smoke_`.
 
 - Basic connectivity (`SELECT 1`)
 - SQL query and DML (`query`, `execute`)
@@ -669,7 +800,8 @@ Smoke test coverage:
   remove, replace, get_and_put, get_and_remove, get_and_replace, get_size
 - `cache_names`, `get_or_create_cache`, `destroy_cache`
 - `Row::get`, `get_by_name`, `len`, `is_empty`, `columns`, `values`
-- `QueryResult::columns` field and `row_count`
+- `QueryResult::columns` and `row_count`
+- `IgniteValue::column_type()` for per-value type accuracy
 - `pool_status()`, `with_pool_size()`, `with_auth()` builder fields
 - Type roundtrips: Bool, Int, Long, Double, String, Byte, Short, Float,
   ByteArray, Decimal, UUID, Null
@@ -677,6 +809,69 @@ Smoke test coverage:
 - Server-side error propagation
 - TLS config builder (no network), TLS graceful failure to plaintext server
 - Concurrent queries on a shared client
+
+---
+
+### `tests/metadata.rs` — 10 tests
+
+Rust port of selected tests from Apache Ignite's `JdbcThinMetadataSelfTest.java`,
+adapted to use `SYS.*` system views via `OP_QUERY_SQL_FIELDS` rather than JDBC
+`DatabaseMetaData`.
+
+| Test | What it verifies |
+|---|---|
+| `metadata_result_set_column_names_and_types` | JOIN query column names and per-value `column_type()` |
+| `metadata_decimal_and_date_column_types` | `ColumnType::Decimal` and `ColumnType::Date` round-trip |
+| `metadata_tables_visible_in_sys_tables_view` | Created table appears in `SYS.TABLES` |
+| `metadata_public_tables_present_in_sys_tables_view` | Multiple tables visible together |
+| `metadata_schemas_visible_in_sys_schemas_view` | `PUBLIC` and `SYS` schemas present |
+| `metadata_sys_schemas_filter_returns_no_rows_for_unknown_pattern` | Empty result for unknown schema |
+| `metadata_columns_visible_in_sys_table_columns_view` | Column names and PK flag in `SYS.TABLE_COLUMNS` |
+| `metadata_pk_index_visible_in_sys_indexes_view` | PK and secondary index in `SYS.INDEXES` |
+| `metadata_all_table_indexes_present_in_sys_indexes_view` | Indexes from multiple tables visible |
+| `metadata_query_unknown_table_returns_error` | Non-existent table query returns `Err` |
+
+---
+
+### `tests/functional_query.rs` — 6 tests
+
+Rust port of Apache Ignite's `FunctionalQueryTest.java` (indexing module).
+
+| Test | Java source | What it verifies |
+|---|---|---|
+| `functional_query_sql_fields_pagination` | `testQueries` | 100-row insert; query 50 rows with small `page_size`; multi-page cursor |
+| `functional_query_sql` | `testSql` | CREATE TABLE, INSERT, SELECT by parameter, SELECT with `page_size=1` |
+| `functional_query_empty_table` | `testGettingEmptyResultWhenQueryingEmptyTable` | Empty table query returns non-error result with 0 rows |
+| `functional_query_mixed_sql_and_cache` | `testMixedQueryAndCacheApiOperations` | SQL INSERT then KV `cache.put`; SELECT sees both |
+| `functional_query_server_error` | `testSqlParameterValidation` | Invalid SQL / missing table returns `Err` |
+| `functional_query_empty_sql` | `testEmptyQuery` | Empty SQL string returns `Err` |
+
+---
+
+### `tests/functional_cache.rs` — 5 tests
+
+Rust port of selected tests from Apache Ignite's `FunctionalTest.java` (thin
+client internal tests), covering the KV cache API.
+
+| Test | Java source | What it verifies |
+|---|---|---|
+| `functional_cache_management` | `testCacheManagement` | Full cache lifecycle: create → `get_size` → name in `cache_names` → destroy → name absent |
+| `functional_cache_put_get` | `testPutGet` | `put`, `get`, `contains_key`, overwrite, remove, multi-type keys |
+| `functional_cache_atomic_put_get` | `testAtomicPutGet` | `get_and_put`, `get_and_remove`, `put_if_absent`, `get_and_replace` sequences |
+| `functional_cache_batch_put_get` | `testBatchPutGet` | `put_all` / `get_all` (full + partial) / `remove_all` subset / `get_size` |
+| `functional_cache_remove_replace` | `testRemoveReplace` | `replace` (true/false) and `remove` / `remove_all` on a 100-entry dataset |
+
+---
+
+### `tests/transaction.rs` — 3 tests
+
+Rust port of selected tests from Apache Ignite's `BlockingTxOpsTest.java`.
+
+| Test | Java source | What it verifies |
+|---|---|---|
+| `tx_sum_invariant` | `testTransactionalConsistency` (Pessimistic/RepeatableRead) | 5 concurrent tasks × 100 key-transfer iterations; sum of all values remains 0 |
+| `tx_sum_invariant_optimistic` | `testTransactionalConsistency` (Optimistic/Serializable) | Same invariant with conflict-retry loop |
+| `tx_all_cache_ops_inside_tx` | `testBlockingOps` | Every cache operation works correctly inside an explicit transaction: `put`, `get`, `contains_key`, `put_all`, `get_all`, `put_if_absent`, `replace`, `get_and_put`, `get_and_remove`, `get_and_replace`, `remove`, `remove_all` |
 
 ---
 

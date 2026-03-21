@@ -1,17 +1,20 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use bigdecimal::BigDecimal;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use num_bigint::{BigInt, Sign};
 use std::str::FromStr;
 use uuid::Uuid;
 
 use super::error::{ProtocolError, Result};
-use super::types::{type_code, IgniteValue};
+use super::types::{IgniteValue, type_code};
 
 // ─── Low-level primitives ─────────────────────────────────────────────────────
 
 fn require(buf: &Bytes, n: usize) -> Result<()> {
     if buf.remaining() < n {
-        Err(ProtocolError::BufferUnderflow { expected: n, got: buf.remaining() })
+        Err(ProtocolError::BufferUnderflow {
+            expected: n,
+            got: buf.remaining(),
+        })
     } else {
         Ok(())
     }
@@ -87,7 +90,10 @@ pub fn write_string_nullable(buf: &mut BytesMut, s: Option<&str>) {
         None => buf.put_u8(type_code::NULL),
         Some(s) => {
             let bytes = s.as_bytes();
-            debug_assert!(bytes.len() <= i32::MAX as usize, "string too large for wire format");
+            debug_assert!(
+                bytes.len() <= i32::MAX as usize,
+                "string too large for wire format"
+            );
             buf.put_u8(type_code::STRING);
             buf.put_i32_le(bytes.len() as i32);
             buf.put_slice(bytes);
@@ -158,23 +164,24 @@ fn decode_value_with_code(buf: &mut Bytes, tc: u8) -> Result<IgniteValue> {
             let scale = read_i32_le(buf)?;
             let byte_count = read_i32_le(buf)?;
             if byte_count < 0 {
-                return Err(ProtocolError::DecimalError(
-                    format!("negative byte count: {byte_count}")
-                ));
+                return Err(ProtocolError::DecimalError(format!(
+                    "negative byte count: {byte_count}"
+                )));
             }
             require(buf, byte_count as usize)?;
             let magnitude = buf.copy_to_bytes(byte_count as usize).to_vec();
             // Two's complement big-endian → BigInt
             let bigint = twos_complement_be_to_bigint(&magnitude);
             let s = format!("{}e-{}", bigint, scale);
-            let decimal = BigDecimal::from_str(&s).map_err(|e| {
-                ProtocolError::DecimalError(e.to_string())
-            })?;
+            let decimal =
+                BigDecimal::from_str(&s).map_err(|e| ProtocolError::DecimalError(e.to_string()))?;
             Ok(IgniteValue::Decimal(decimal))
         }
         BYTE_ARRAY => {
             let len = read_i32_le(buf)?;
-            if len < 0 { return Ok(IgniteValue::Null); }
+            if len < 0 {
+                return Ok(IgniteValue::Null);
+            }
             require(buf, len as usize)?;
             let data = buf.copy_to_bytes(len as usize).to_vec();
             Ok(IgniteValue::ByteArray(data))
@@ -189,20 +196,64 @@ fn decode_value_with_code(buf: &mut Bytes, tc: u8) -> Result<IgniteValue> {
             if payload_len < 0 {
                 return Err(ProtocolError::UnknownTypeCode(BINARY_OBJECT));
             }
-            require(buf, payload_len as usize + 4)?;   // payload + trailing i32 offset
+            require(buf, payload_len as usize + 4)?; // payload + trailing i32 offset
             let data = buf.copy_to_bytes(payload_len as usize).to_vec();
-            let _offset = read_i32_le(buf)?;            // consumed but not stored
+            let _offset = read_i32_le(buf)?; // consumed but not stored
             Ok(IgniteValue::RawObject(data))
         }
         // COMPLEX_OBJECT, OBJECT_ARRAY, MAP, ENUM have variable-length formats that
         // require schema/type metadata to parse correctly.  Return an error rather
         // than silently consuming all remaining buffer bytes (which would corrupt
         // subsequent field decoding in multi-column rows).
-        COMPLEX_OBJECT | OBJECT_ARRAY | MAP | ENUM => {
-            Err(ProtocolError::UnknownTypeCode(tc))
+        COMPLEX_OBJECT | OBJECT_ARRAY | MAP | ENUM => Err(ProtocolError::UnknownTypeCode(tc)),
+        // OPTM_MARSH (0xFE): Java ObjectOutputStream payload.  Ignite returns
+        // java.sql.Date, java.sql.Time and java.sql.Timestamp via this code
+        // when they appear as SQL result-set column values.
+        OPTM_MARSH => {
+            let len = read_i32_le(buf)?;
+            if len < 0 {
+                return Ok(IgniteValue::Null);
+            }
+            let len = len as usize;
+            require(buf, len)?;
+            let raw = buf.copy_to_bytes(len);
+            Ok(decode_optm_marsh_temporal(&raw)
+                .unwrap_or_else(|| IgniteValue::RawObject(raw.to_vec())))
         }
         other => Err(ProtocolError::UnknownTypeCode(other)),
     }
+}
+
+// ─── OPTM_MARSH decoder ───────────────────────────────────────────────────────
+
+/// Attempt to decode an OPTM_MARSH payload as a Java SQL temporal type.
+///
+/// Ignite 2.x uses the "optimised marshaller" type code (0xFE) for
+/// `java.sql.Date` SQL column values returned by `OP_QUERY_SQL_FIELDS`.
+/// `java.sql.Time` and `java.sql.Timestamp` are returned as native Ignite
+/// binary type codes 36 and 33 respectively, so they do **not** arrive here.
+///
+/// # Empirically observed payload format for `java.sql.Date` (Ignite 2.17)
+///
+/// ```text
+/// [7 bytes]  Ignite OptimizedMarshaller class-descriptor prefix
+///            (constant for java.sql.Date: 66 3A DE D5 40 97 66)
+/// [8 bytes]  milliseconds since epoch — LE i64
+/// ──── total: 15 bytes ────
+/// ```
+///
+/// Returns `None` if the payload does not look like a `java.sql.Date` (wrong
+/// length or unexpected structure), so the caller falls back to
+/// `IgniteValue::RawObject`.
+fn decode_optm_marsh_temporal(data: &[u8]) -> Option<IgniteValue> {
+    // The java.sql.Date OPTM_MARSH payload is always exactly 15 bytes in
+    // Ignite 2.x: a 7-byte class-descriptor header followed by the date
+    // value as a little-endian int64 (milliseconds since epoch).
+    if data.len() == 15 {
+        let ms = i64::from_le_bytes(data[7..15].try_into().ok()?);
+        return Some(IgniteValue::Date(ms));
+    }
+    None
 }
 
 // ─── Two's complement big-endian bytes → BigInt ──────────────────────────────
@@ -219,7 +270,9 @@ fn twos_complement_be_to_bigint(bytes: &[u8]) -> BigInt {
         for b in inverted.iter_mut().rev() {
             let (v, carry) = b.overflowing_add(1);
             *b = v;
-            if !carry { break; }
+            if !carry {
+                break;
+            }
         }
         BigInt::from_bytes_be(Sign::Minus, &inverted)
     } else {
@@ -299,7 +352,10 @@ pub fn encode_value(buf: &mut BytesMut, val: &IgniteValue) {
         IgniteValue::String(s) => {
             buf.put_u8(STRING);
             let bytes = s.as_bytes();
-            debug_assert!(bytes.len() <= i32::MAX as usize, "String value too large for wire format");
+            debug_assert!(
+                bytes.len() <= i32::MAX as usize,
+                "String value too large for wire format"
+            );
             buf.put_i32_le(bytes.len() as i32);
             buf.put_slice(bytes);
         }
@@ -330,7 +386,10 @@ pub fn encode_value(buf: &mut BytesMut, val: &IgniteValue) {
         }
         IgniteValue::ByteArray(data) => {
             buf.put_u8(BYTE_ARRAY);
-            debug_assert!(data.len() <= i32::MAX as usize, "ByteArray value too large for wire format");
+            debug_assert!(
+                data.len() <= i32::MAX as usize,
+                "ByteArray value too large for wire format"
+            );
             buf.put_i32_le(data.len() as i32);
             buf.put_slice(data);
         }
@@ -338,10 +397,13 @@ pub fn encode_value(buf: &mut BytesMut, val: &IgniteValue) {
             // Encode as BINARY_OBJECT (type code 27):
             //   [u8: type_code=27] [i32: payload_len] [payload bytes] [i32: offset=0]
             buf.put_u8(BINARY_OBJECT);
-            debug_assert!(data.len() <= i32::MAX as usize, "RawObject value too large for wire format");
+            debug_assert!(
+                data.len() <= i32::MAX as usize,
+                "RawObject value too large for wire format"
+            );
             buf.put_i32_le(data.len() as i32);
             buf.put_slice(data);
-            buf.put_i32_le(0);   // offset = 0: object starts at beginning of payload
+            buf.put_i32_le(0); // offset = 0: object starts at beginning of payload
         }
     }
 }
@@ -365,24 +427,36 @@ mod tests {
     #[test]
     fn roundtrip_bool() {
         assert_eq!(roundtrip(IgniteValue::Bool(true)), IgniteValue::Bool(true));
-        assert_eq!(roundtrip(IgniteValue::Bool(false)), IgniteValue::Bool(false));
+        assert_eq!(
+            roundtrip(IgniteValue::Bool(false)),
+            IgniteValue::Bool(false)
+        );
     }
 
     #[test]
     fn roundtrip_int() {
         assert_eq!(roundtrip(IgniteValue::Int(-42)), IgniteValue::Int(-42));
-        assert_eq!(roundtrip(IgniteValue::Int(i32::MAX)), IgniteValue::Int(i32::MAX));
+        assert_eq!(
+            roundtrip(IgniteValue::Int(i32::MAX)),
+            IgniteValue::Int(i32::MAX)
+        );
     }
 
     #[test]
     fn roundtrip_long() {
-        assert_eq!(roundtrip(IgniteValue::Long(i64::MIN)), IgniteValue::Long(i64::MIN));
+        assert_eq!(
+            roundtrip(IgniteValue::Long(i64::MIN)),
+            IgniteValue::Long(i64::MIN)
+        );
     }
 
     #[test]
     fn roundtrip_string() {
         let s = "Hello, Ignite!".to_string();
-        assert_eq!(roundtrip(IgniteValue::String(s.clone())), IgniteValue::String(s));
+        assert_eq!(
+            roundtrip(IgniteValue::String(s.clone())),
+            IgniteValue::String(s)
+        );
     }
 
     #[test]
@@ -399,41 +473,77 @@ mod tests {
 
     #[test]
     fn roundtrip_byte() {
-        assert_eq!(roundtrip(IgniteValue::Byte(i8::MIN)), IgniteValue::Byte(i8::MIN));
+        assert_eq!(
+            roundtrip(IgniteValue::Byte(i8::MIN)),
+            IgniteValue::Byte(i8::MIN)
+        );
         assert_eq!(roundtrip(IgniteValue::Byte(0)), IgniteValue::Byte(0));
-        assert_eq!(roundtrip(IgniteValue::Byte(i8::MAX)), IgniteValue::Byte(i8::MAX));
+        assert_eq!(
+            roundtrip(IgniteValue::Byte(i8::MAX)),
+            IgniteValue::Byte(i8::MAX)
+        );
     }
 
     #[test]
     fn roundtrip_short() {
-        assert_eq!(roundtrip(IgniteValue::Short(i16::MIN)), IgniteValue::Short(i16::MIN));
-        assert_eq!(roundtrip(IgniteValue::Short(i16::MAX)), IgniteValue::Short(i16::MAX));
+        assert_eq!(
+            roundtrip(IgniteValue::Short(i16::MIN)),
+            IgniteValue::Short(i16::MIN)
+        );
+        assert_eq!(
+            roundtrip(IgniteValue::Short(i16::MAX)),
+            IgniteValue::Short(i16::MAX)
+        );
     }
 
     #[test]
     fn roundtrip_float() {
-        assert_eq!(roundtrip(IgniteValue::Float(3.14_f32)), IgniteValue::Float(3.14_f32));
-        assert_eq!(roundtrip(IgniteValue::Float(f32::NEG_INFINITY)), IgniteValue::Float(f32::NEG_INFINITY));
+        assert_eq!(
+            roundtrip(IgniteValue::Float(3.14_f32)),
+            IgniteValue::Float(3.14_f32)
+        );
+        assert_eq!(
+            roundtrip(IgniteValue::Float(f32::NEG_INFINITY)),
+            IgniteValue::Float(f32::NEG_INFINITY)
+        );
     }
 
     #[test]
     fn roundtrip_double() {
-        assert_eq!(roundtrip(IgniteValue::Double(std::f64::consts::PI)), IgniteValue::Double(std::f64::consts::PI));
-        assert_eq!(roundtrip(IgniteValue::Double(f64::MAX)), IgniteValue::Double(f64::MAX));
+        assert_eq!(
+            roundtrip(IgniteValue::Double(std::f64::consts::PI)),
+            IgniteValue::Double(std::f64::consts::PI)
+        );
+        assert_eq!(
+            roundtrip(IgniteValue::Double(f64::MAX)),
+            IgniteValue::Double(f64::MAX)
+        );
     }
 
     #[test]
     fn roundtrip_char() {
-        assert_eq!(roundtrip(IgniteValue::Char(b'A' as u16)), IgniteValue::Char(b'A' as u16));
-        assert_eq!(roundtrip(IgniteValue::Char(0x0410)), IgniteValue::Char(0x0410)); // Cyrillic А
+        assert_eq!(
+            roundtrip(IgniteValue::Char(b'A' as u16)),
+            IgniteValue::Char(b'A' as u16)
+        );
+        assert_eq!(
+            roundtrip(IgniteValue::Char(0x0410)),
+            IgniteValue::Char(0x0410)
+        ); // Cyrillic А
     }
 
     #[test]
     fn roundtrip_date() {
         // 2024-01-15 as millis since epoch
-        assert_eq!(roundtrip(IgniteValue::Date(1_705_276_800_000)), IgniteValue::Date(1_705_276_800_000));
+        assert_eq!(
+            roundtrip(IgniteValue::Date(1_705_276_800_000)),
+            IgniteValue::Date(1_705_276_800_000)
+        );
         assert_eq!(roundtrip(IgniteValue::Date(0)), IgniteValue::Date(0));
-        assert_eq!(roundtrip(IgniteValue::Date(-86_400_000)), IgniteValue::Date(-86_400_000));
+        assert_eq!(
+            roundtrip(IgniteValue::Date(-86_400_000)),
+            IgniteValue::Date(-86_400_000)
+        );
     }
 
     #[test]
@@ -447,17 +557,29 @@ mod tests {
     #[test]
     fn roundtrip_byte_array() {
         let data = vec![0u8, 1, 127, 128, 255];
-        assert_eq!(roundtrip(IgniteValue::ByteArray(data.clone())), IgniteValue::ByteArray(data));
-        assert_eq!(roundtrip(IgniteValue::ByteArray(vec![])), IgniteValue::ByteArray(vec![]));
+        assert_eq!(
+            roundtrip(IgniteValue::ByteArray(data.clone())),
+            IgniteValue::ByteArray(data)
+        );
+        assert_eq!(
+            roundtrip(IgniteValue::ByteArray(vec![])),
+            IgniteValue::ByteArray(vec![])
+        );
     }
 
     #[test]
     fn roundtrip_raw_object() {
         // Non-empty payload
         let data = vec![1u8, 2, 3, 42, 99];
-        assert_eq!(roundtrip(IgniteValue::RawObject(data.clone())), IgniteValue::RawObject(data));
+        assert_eq!(
+            roundtrip(IgniteValue::RawObject(data.clone())),
+            IgniteValue::RawObject(data)
+        );
         // Empty payload
-        assert_eq!(roundtrip(IgniteValue::RawObject(vec![])), IgniteValue::RawObject(vec![]));
+        assert_eq!(
+            roundtrip(IgniteValue::RawObject(vec![])),
+            IgniteValue::RawObject(vec![])
+        );
     }
 
     #[test]
@@ -505,7 +627,17 @@ mod tests {
     #[test]
     fn twos_complement_boundary() {
         // Ensure values at byte boundaries don't gain/lose a sign-extension byte
-        for v in [127i64, 128, -128, -129, 255, 256, -256, i32::MAX as i64, i32::MIN as i64] {
+        for v in [
+            127i64,
+            128,
+            -128,
+            -129,
+            255,
+            256,
+            -256,
+            i32::MAX as i64,
+            i32::MIN as i64,
+        ] {
             let n = BigInt::from(v);
             let bytes = bigint_to_twos_complement_be(&n);
             let back = twos_complement_be_to_bigint(&bytes);
