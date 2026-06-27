@@ -86,6 +86,9 @@ pub struct IgniteConnection {
     /// (protocol ≥ 1.4).  Used by partition-aware routing to key this
     /// connection's pool by node.  `None` if the server did not advertise it.
     node_id: Option<Uuid>,
+    /// Whether `DC_AWARE` was negotiated with this server — gates the DC-aware
+    /// `CACHE_PARTITIONS` request/response wire format.
+    dc_aware: bool,
     /// Latest affinity topology version observed on a response header
     /// (flag `0x02`).  `major` holds [`i64::MIN`] until the first such header is
     /// seen.  Shared across clones; used to detect when partition mappings are
@@ -201,8 +204,12 @@ impl IgniteConnection {
         let hs_resp = crate::protocol::handshake::HandshakeResponse::decode(&mut hs_bytes)
             .map_err(TransportError::Protocol)?;
         let node_id = hs_resp.node_id;
+        // Negotiate DC_AWARE: only use the DC-aware CACHE_PARTITIONS wire format
+        // when both client and server support it, or the server desyncs.
+        let dc_aware = crate::protocol::handshake::ADVERTISE_DC_AWARE
+            && crate::protocol::handshake::server_supports_dc_aware(&hs_resp.features);
 
-        debug!(?node_id, "Ignite handshake successful");
+        debug!(?node_id, dc_aware, "Ignite handshake successful");
 
         // ── Shared state ──────────────────────────────────────────────────────
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -276,6 +283,7 @@ impl IgniteConnection {
             alive,
             request_timeout,
             node_id,
+            dc_aware,
             topology_major: Arc::new(AtomicI64::new(i64::MIN)),
             topology_minor: Arc::new(AtomicI32::new(0)),
             reader_abort,
@@ -286,6 +294,11 @@ impl IgniteConnection {
     /// `None` if the server did not advertise it.
     pub fn node_id(&self) -> Option<Uuid> {
         self.node_id
+    }
+
+    /// Whether `DC_AWARE` was negotiated with this server.
+    pub fn dc_aware(&self) -> bool {
+        self.dc_aware
     }
 
     /// The latest affinity topology version `(major, minor)` observed on a

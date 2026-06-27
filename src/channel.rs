@@ -298,15 +298,22 @@ impl ChannelRegistry {
     }
 
     async fn fetch_partitions(&self, cache_id: i32) -> Result<CachePartitionsResponse> {
-        let req_id = next_request_id();
-        let payload = encode_cache_partitions_request(req_id, &[cache_id]);
         let conn = self.get_default().await?;
+        // Use the DC-aware wire format only when this server negotiated it.
+        let dc_aware = conn.dc_aware();
+        let req_id = next_request_id();
+        let payload = encode_cache_partitions_request(
+            req_id,
+            &[cache_id],
+            dc_aware,
+            self.config.data_center_id.as_deref(),
+        );
         let mut resp = conn
             .request(req_id, payload)
             .await
             .map_err(IgniteError::Transport)?;
         self.observe_topology(&conn);
-        decode_cache_partitions(&mut resp).map_err(IgniteError::Protocol)
+        decode_cache_partitions(&mut resp, dc_aware).map_err(IgniteError::Protocol)
     }
 }
 

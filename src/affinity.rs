@@ -17,7 +17,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 use uuid::Uuid;
 
 use crate::protocol::IgniteValue;
-use crate::protocol::codec::{read_bool, read_i32_le, read_i64_le, read_uuid_obj};
+use crate::protocol::codec::{
+    read_bool, read_i32_le, read_i64_le, read_uuid_obj, write_string_nullable,
+};
 use crate::protocol::error::Result;
 use crate::protocol::messages::write_request_header;
 use crate::protocol::op_code;
@@ -51,6 +53,11 @@ pub struct CacheAffinityMapping {
     /// `partition number → primary node UUID`, indexed by partition.  `None`
     /// marks a partition with no known primary (fall back to default channel).
     pub partition_nodes: Vec<Option<Uuid>>,
+    /// `partition number → same-data-center owner` (DC_AWARE).  Used to route
+    /// read-only ops to a backup in the current data center; equals
+    /// [`Self::partition_nodes`] when the server sent no distinct DC map (the
+    /// common single-data-center case).
+    pub dc_partition_nodes: Vec<Option<Uuid>>,
     /// Number of partitions (`== partition_nodes.len()`).
     pub parts: i32,
     /// Precomputed rendezvous mask for `parts` (see [`calculate_mask`]).
@@ -72,12 +79,23 @@ pub struct CachePartitionsResponse {
 
 /// Encode a `CACHE_PARTITIONS` (op 1101) request for the given cache ids.
 ///
-/// With an empty feature bitmask advertised the body is simply
-/// `[i32: count][i32: cacheId]…` — the `ALL_AFFINITY_MAPPINGS` boolean and the
-/// `DC_AWARE` data-center string are omitted.
-pub fn encode_cache_partitions_request(req_id: i64, cache_ids: &[i32]) -> Bytes {
+/// When `dc_aware` is set (the client advertised `DC_AWARE`), the client's
+/// data-center id string (`dc_id`, null when `None`) precedes the cache-id set;
+/// a non-null id asks the server for a same-DC partition map.  We never
+/// advertise `ALL_AFFINITY_MAPPINGS`, so its `customMappingsRequired` boolean is
+/// omitted.
+pub fn encode_cache_partitions_request(
+    req_id: i64,
+    cache_ids: &[i32],
+    dc_aware: bool,
+    dc_id: Option<&str>,
+) -> Bytes {
     let mut buf = BytesMut::new();
     write_request_header(&mut buf, op_code::CACHE_PARTITIONS, req_id);
+    if dc_aware {
+        // This client's data-center id (null = no DC affinity).
+        write_string_nullable(&mut buf, dc_id);
+    }
     debug_assert!(
         cache_ids.len() <= i32::MAX as usize,
         "too many cache ids for wire format"
@@ -90,9 +108,13 @@ pub fn encode_cache_partitions_request(req_id: i64, cache_ids: &[i32]) -> Bytes 
 }
 
 /// Decode a `CACHE_PARTITIONS` response body (after the response header has been
-/// stripped) in the simplest wire format (empty feature bitmask: no
-/// `DC_AWARE`, no `ALL_AFFINITY_MAPPINGS` fields).
-pub fn decode_cache_partitions(buf: &mut Bytes) -> Result<CachePartitionsResponse> {
+/// stripped).
+///
+/// When `dc_aware` is set, each applicable group carries a second
+/// "data-center" partition map after the primary one (used for read-from-backup
+/// routing); an empty DC map means "same as primary".  We never advertise
+/// `ALL_AFFINITY_MAPPINGS`, so no `dfltMapping` boolean is present.
+pub fn decode_cache_partitions(buf: &mut Bytes, dc_aware: bool) -> Result<CachePartitionsResponse> {
     let major = read_i64_le(buf)?;
     let minor = read_i32_le(buf)?;
     let version = AffinityTopologyVersion::new(major, minor);
@@ -115,6 +137,17 @@ pub fn decode_cache_partitions(buf: &mut Bytes) -> Result<CachePartitionsRespons
 
             // primary partition → node mapping
             let partition_nodes = read_node_partitions(buf)?;
+            // data-center partition → node mapping (DC_AWARE); empty → primary.
+            let dc_partition_nodes = if dc_aware {
+                let dc = read_node_partitions(buf)?;
+                if dc.is_empty() {
+                    partition_nodes.clone()
+                } else {
+                    dc
+                }
+            } else {
+                partition_nodes.clone()
+            };
             let parts = partition_nodes.len() as i32;
             let mask = calculate_mask(parts);
 
@@ -122,6 +155,7 @@ pub fn decode_cache_partitions(buf: &mut Bytes) -> Result<CachePartitionsRespons
                 mappings.push(CacheAffinityMapping {
                     cache_id,
                     partition_nodes: partition_nodes.clone(),
+                    dc_partition_nodes: dc_partition_nodes.clone(),
                     parts,
                     mask,
                     key_cfg,
@@ -134,6 +168,7 @@ pub fn decode_cache_partitions(buf: &mut Bytes) -> Result<CachePartitionsRespons
                 mappings.push(CacheAffinityMapping {
                     cache_id,
                     partition_nodes: Vec::new(),
+                    dc_partition_nodes: Vec::new(),
                     parts: 0,
                     mask: -1,
                     key_cfg: HashMap::new(),
@@ -313,7 +348,11 @@ impl AffinityContext {
     /// Compute the primary node owning `key` in cache `cache_id`, or `None` to
     /// fall back to the default channel (PA disabled, unknown cache, unsupported
     /// key, or unmapped partition).
-    pub fn affinity_node(&self, cache_id: i32, key: &IgniteValue) -> Option<Uuid> {
+    /// `primary = true` routes to the partition's primary owner; `primary =
+    /// false` (read-only ops) routes to the same-data-center owner from the DC
+    /// map, which equals the primary unless the server supplied a distinct DC
+    /// mapping.
+    pub fn affinity_node(&self, cache_id: i32, key: &IgniteValue, primary: bool) -> Option<Uuid> {
         if !self.is_enabled() {
             return None;
         }
@@ -324,7 +363,12 @@ impl AffinityContext {
             return None;
         }
         let part = partition(hash, m.mask, m.parts);
-        m.partition_nodes.get(part as usize).copied().flatten()
+        let nodes = if primary {
+            &m.partition_nodes
+        } else {
+            &m.dc_partition_nodes
+        };
+        nodes.get(part as usize).copied().flatten()
     }
 
     /// Merge a decoded `CACHE_PARTITIONS` response into the held mappings,
@@ -417,7 +461,7 @@ mod tests {
 
     #[test]
     fn encode_partitions_request_writes_header_and_cache_ids() {
-        let bytes = encode_cache_partitions_request(7, &[100, 200]);
+        let bytes = encode_cache_partitions_request(7, &[100, 200], false, None);
         let mut b = bytes.clone();
         assert_eq!(b.get_i16_le(), op_code::CACHE_PARTITIONS); // op
         assert_eq!(b.get_i64_le(), 7); // req id
@@ -455,7 +499,7 @@ mod tests {
         buf.put_i32_le(3);
 
         let mut bytes = buf.freeze();
-        let resp = decode_cache_partitions(&mut bytes).unwrap();
+        let resp = decode_cache_partitions(&mut bytes, false).unwrap();
 
         assert_eq!(resp.version, AffinityTopologyVersion::new(5, 0));
         assert_eq!(resp.mappings.len(), 1);
@@ -491,7 +535,7 @@ mod tests {
         buf.put_i32_le(0);
 
         let mut bytes = buf.freeze();
-        let resp = decode_cache_partitions(&mut bytes).unwrap();
+        let resp = decode_cache_partitions(&mut bytes, false).unwrap();
         let m = &resp.mappings[0];
         assert_eq!(m.key_cfg.get(&777), Some(&888));
         assert_eq!(m.partition_nodes, vec![Some(node)]);
@@ -509,13 +553,129 @@ mod tests {
         buf.put_i32_le(201);
 
         let mut bytes = buf.freeze();
-        let resp = decode_cache_partitions(&mut bytes).unwrap();
+        let resp = decode_cache_partitions(&mut bytes, false).unwrap();
         assert_eq!(resp.version, AffinityTopologyVersion::new(9, 2));
         assert_eq!(resp.mappings.len(), 2);
         assert!(resp.mappings.iter().all(|m| !m.applicable));
         assert_eq!(resp.mappings[0].cache_id, 200);
         assert_eq!(resp.mappings[1].cache_id, 201);
         assert_eq!(bytes.remaining(), 0);
+    }
+
+    #[test]
+    fn encode_partitions_request_dc_aware_prefixes_null_dcid() {
+        let bytes = encode_cache_partitions_request(7, &[100], true, None);
+        let mut b = bytes.clone();
+        assert_eq!(b.get_i16_le(), op_code::CACHE_PARTITIONS);
+        assert_eq!(b.get_i64_le(), 7);
+        // DC_AWARE: a null data-center id string precedes the cache-id set.
+        assert_eq!(b.get_u8(), crate::protocol::types::type_code::NULL);
+        assert_eq!(b.get_i32_le(), 1); // count
+        assert_eq!(b.get_i32_le(), 100);
+        assert_eq!(b.remaining(), 0);
+    }
+
+    #[test]
+    fn encode_partitions_request_dc_aware_writes_dcid() {
+        let bytes = encode_cache_partitions_request(7, &[100], true, Some("DC1"));
+        let mut b = bytes.clone();
+        assert_eq!(b.get_i16_le(), op_code::CACHE_PARTITIONS);
+        assert_eq!(b.get_i64_le(), 7);
+        // DC_AWARE: the client's data-center id as a typed string.
+        assert_eq!(b.get_u8(), crate::protocol::types::type_code::STRING);
+        assert_eq!(b.get_i32_le(), 3); // "DC1" length
+        let mut name = [0u8; 3];
+        b.copy_to_slice(&mut name);
+        assert_eq!(&name, b"DC1");
+        assert_eq!(b.get_i32_le(), 1); // count
+        assert_eq!(b.get_i32_le(), 100);
+        assert_eq!(b.remaining(), 0);
+    }
+
+    #[test]
+    fn decode_partitions_dc_aware_reads_distinct_dc_map() {
+        let a = Uuid::from_u128(0xA);
+        let b = Uuid::from_u128(0xB);
+        let mut buf = BytesMut::new();
+        buf.put_i64_le(1);
+        buf.put_i32_le(0);
+        buf.put_i32_le(1); // mappingsCnt
+        buf.put_u8(1); // applicable
+        buf.put_i32_le(1); // cachesCnt
+        buf.put_i32_le(100); // cacheId
+        buf.put_i32_le(0); // keyCfgCnt
+        // primary map: A→part0, B→part1
+        buf.put_i32_le(2);
+        put_uuid(&mut buf, a);
+        buf.put_i32_le(1);
+        buf.put_i32_le(0);
+        put_uuid(&mut buf, b);
+        buf.put_i32_le(1);
+        buf.put_i32_le(1);
+        // dc map: swapped — B→part0, A→part1
+        buf.put_i32_le(2);
+        put_uuid(&mut buf, b);
+        buf.put_i32_le(1);
+        buf.put_i32_le(0);
+        put_uuid(&mut buf, a);
+        buf.put_i32_le(1);
+        buf.put_i32_le(1);
+
+        let mut bytes = buf.freeze();
+        let resp = decode_cache_partitions(&mut bytes, true).unwrap();
+        let m = &resp.mappings[0];
+        assert_eq!(m.partition_nodes, vec![Some(a), Some(b)]);
+        assert_eq!(m.dc_partition_nodes, vec![Some(b), Some(a)]);
+        assert_eq!(bytes.remaining(), 0, "all bytes consumed");
+    }
+
+    #[test]
+    fn decode_partitions_dc_aware_empty_dc_map_falls_back_to_primary() {
+        let a = Uuid::from_u128(0xA);
+        let mut buf = BytesMut::new();
+        buf.put_i64_le(1);
+        buf.put_i32_le(0);
+        buf.put_i32_le(1);
+        buf.put_u8(1);
+        buf.put_i32_le(1);
+        buf.put_i32_le(100);
+        buf.put_i32_le(0);
+        // primary map: A→part0
+        buf.put_i32_le(1);
+        put_uuid(&mut buf, a);
+        buf.put_i32_le(1);
+        buf.put_i32_le(0);
+        // dc map: empty (nodesCnt = 0) → server has no distinct DC mapping
+        buf.put_i32_le(0);
+
+        let mut bytes = buf.freeze();
+        let resp = decode_cache_partitions(&mut bytes, true).unwrap();
+        let m = &resp.mappings[0];
+        assert_eq!(m.dc_partition_nodes, m.partition_nodes, "empty DC map → primary");
+        assert_eq!(bytes.remaining(), 0);
+    }
+
+    #[test]
+    fn affinity_node_read_uses_dc_map_write_uses_primary() {
+        let a = Uuid::from_u128(0xA);
+        let b = Uuid::from_u128(0xB);
+        let ctx = AffinityContext::new(true);
+        let m = CacheAffinityMapping {
+            cache_id: 100,
+            partition_nodes: vec![Some(a), Some(b)],
+            dc_partition_nodes: vec![Some(b), Some(a)], // swapped DC owners
+            parts: 2,
+            mask: calculate_mask(2),
+            key_cfg: HashMap::new(),
+            applicable: true,
+        };
+        ctx.apply_response(response(1, 0, vec![m]));
+
+        // Int(0) → partition 0; Int(1) → partition 1 (mask=1, parts=2).
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0), true), Some(a));
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0), false), Some(b));
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(1), true), Some(b));
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(1), false), Some(a));
     }
 
     #[test]
@@ -534,6 +694,7 @@ mod tests {
         let parts = nodes.len() as i32;
         CacheAffinityMapping {
             cache_id,
+            dc_partition_nodes: nodes.clone(),
             partition_nodes: nodes,
             parts,
             mask: calculate_mask(parts),
@@ -560,31 +721,31 @@ mod tests {
             vec![mapping(100, vec![Some(a), Some(b), Some(a), Some(b)])],
         ));
         // partition(Int(n)) == n & 3 for parts=4 (mask=3, n>>>16 == 0).
-        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0)), Some(a));
-        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(1)), Some(b));
-        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(2)), Some(a));
-        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(3)), Some(b));
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0), true),Some(a));
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(1), true),Some(b));
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(2), true),Some(a));
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(3), true),Some(b));
     }
 
     #[test]
     fn affinity_node_unknown_cache_is_none() {
         let ctx = AffinityContext::new(true);
         ctx.apply_response(response(1, 0, vec![mapping(100, vec![Some(Uuid::from_u128(0xA))])]));
-        assert_eq!(ctx.affinity_node(999, &IgniteValue::Int(0)), None);
+        assert_eq!(ctx.affinity_node(999, &IgniteValue::Int(0), true),None);
     }
 
     #[test]
     fn affinity_node_unsupported_key_is_none() {
         let ctx = AffinityContext::new(true);
         ctx.apply_response(response(1, 0, vec![mapping(100, vec![Some(Uuid::from_u128(0xA))])]));
-        assert_eq!(ctx.affinity_node(100, &IgniteValue::Float(1.0)), None);
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Float(1.0), true),None);
     }
 
     #[test]
     fn affinity_node_disabled_is_none() {
         let ctx = AffinityContext::new(false);
         ctx.apply_response(response(1, 0, vec![mapping(100, vec![Some(Uuid::from_u128(0xA))])]));
-        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0)), None);
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0), true),None);
     }
 
     #[test]
@@ -593,7 +754,7 @@ mod tests {
         let mut m = mapping(100, vec![]);
         m.applicable = false;
         ctx.apply_response(response(1, 0, vec![m]));
-        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0)), None);
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0), true),None);
     }
 
     #[test]
@@ -603,8 +764,8 @@ mod tests {
         ctx.apply_response(response(6, 0, vec![mapping(200, vec![Some(Uuid::from_u128(0xB))])]));
         assert_eq!(ctx.version(), AffinityTopologyVersion::new(6, 0));
         // cache 100's mapping was dropped on the newer topology.
-        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0)), None);
-        assert_eq!(ctx.affinity_node(200, &IgniteValue::Int(0)), Some(Uuid::from_u128(0xB)));
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0), true),None);
+        assert_eq!(ctx.affinity_node(200, &IgniteValue::Int(0), true),Some(Uuid::from_u128(0xB)));
     }
 
     #[test]
@@ -612,8 +773,8 @@ mod tests {
         let ctx = AffinityContext::new(true);
         ctx.apply_response(response(5, 0, vec![mapping(100, vec![Some(Uuid::from_u128(0xA))])]));
         ctx.apply_response(response(5, 0, vec![mapping(200, vec![Some(Uuid::from_u128(0xB))])]));
-        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0)), Some(Uuid::from_u128(0xA)));
-        assert_eq!(ctx.affinity_node(200, &IgniteValue::Int(0)), Some(Uuid::from_u128(0xB)));
+        assert_eq!(ctx.affinity_node(100, &IgniteValue::Int(0), true),Some(Uuid::from_u128(0xA)));
+        assert_eq!(ctx.affinity_node(200, &IgniteValue::Int(0), true),Some(Uuid::from_u128(0xB)));
     }
 
     #[test]
@@ -622,7 +783,7 @@ mod tests {
         ctx.apply_response(response(5, 0, vec![mapping(100, vec![Some(Uuid::from_u128(0xA))])]));
         ctx.apply_response(response(4, 0, vec![mapping(200, vec![Some(Uuid::from_u128(0xB))])]));
         assert_eq!(ctx.version(), AffinityTopologyVersion::new(5, 0));
-        assert_eq!(ctx.affinity_node(200, &IgniteValue::Int(0)), None);
+        assert_eq!(ctx.affinity_node(200, &IgniteValue::Int(0), true),None);
     }
 
     #[test]

@@ -24,6 +24,11 @@ pub struct IgniteClientConfig {
     /// it.  Only has effect when partition awareness is enabled — the client
     /// then learns cluster nodes not in [`Self::addresses`] and routes to them.
     pub endpoint_discovery: Option<bool>,
+    /// This client's data-center id (DC_AWARE).  When set and the server
+    /// supports `DC_AWARE`, read-only ops are routed to a partition owner in
+    /// this data center (a backup) instead of the primary.  `None` = no DC
+    /// affinity (reads go to the primary).
+    pub data_center_id: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub max_pool_size: usize,
@@ -53,6 +58,7 @@ impl IgniteClientConfig {
             address,
             partition_awareness: None,
             endpoint_discovery: None,
+            data_center_id: None,
             username: None,
             password: None,
             max_pool_size: 10,
@@ -85,6 +91,12 @@ impl IgniteClientConfig {
     /// Only effective when partition awareness is enabled.
     pub fn with_endpoint_discovery(mut self, enabled: bool) -> Self {
         self.endpoint_discovery = Some(enabled);
+        self
+    }
+
+    /// Set this client's data-center id for `DC_AWARE` read-from-backup routing.
+    pub fn with_data_center_id(mut self, dc_id: impl Into<String>) -> Self {
+        self.data_center_id = Some(dc_id.into());
         self
     }
 
@@ -143,6 +155,7 @@ impl fmt::Debug for IgniteClientConfig {
             .field("addresses", &self.addresses)
             .field("partition_awareness", &self.partition_awareness)
             .field("endpoint_discovery", &self.endpoint_discovery)
+            .field("data_center_id", &self.data_center_id)
             .field("username", &self.username)
             .field("password", &self.password.as_deref().map(|_| "[REDACTED]"))
             .field("max_pool_size", &self.max_pool_size)

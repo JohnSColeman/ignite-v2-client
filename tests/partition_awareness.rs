@@ -110,6 +110,64 @@ async fn pa_endpoint_discovery_reaches_unconfigured_nodes() {
     c.destroy_cache("PA_DISCOVERY").await.ok();
 }
 
+/// Cache the DC read-hop demo uses.  It must be pre-defined on the cluster with
+/// `FULL_SYNC` + `readFromBackup` (see `local-cluster/ignite-config.xml`) — the
+/// server only emits a same-DC partition map for caches configured that way, and
+/// the client cannot create a cache with those settings.  The literal must match
+/// the cache name in that config file.
+const DC_DEMO_CACHE: &str = "DC_DEMO";
+
+/// The client's data-center id for the demo; must match a node DC id set by
+/// `local-cluster/start.sh` in `IGNITE_DC_DEMO` mode (nodes 1 & 2 are `DC1`).
+const DC_DEMO_CLIENT_DC: &str = "DC1";
+
+/// DC-aware read-from-backup path. Best run on a DC-configured cluster
+/// (`IGNITE_DC_DEMO=1 ./local-cluster/start.sh`, nodes 1&2 = DC1, node 3 = DC2)
+/// with the pre-defined [`DC_DEMO_CACHE`] cache (FULL_SYNC + readFromBackup).
+///
+/// With the client's `dcId = DC1`, the server returns a same-DC partition map,
+/// so reads of keys whose primary is the DC2 node route to a DC1 backup rather
+/// than the primary. This exercises the full DC path — the request carries the
+/// `dcId`, the response's DC partition map is decoded, and reads route through
+/// it — and asserts every value still reads back correctly. (Against a non-DC
+/// cluster the DC map is empty and reads fall back to the primary; the test
+/// still passes.)
+#[tokio::test]
+async fn pa_dc_aware_read_path_is_correct() {
+    init_tracing();
+    let cfg = IgniteClientConfig::new("localhost:10800")
+        .with_addresses(addresses())
+        .with_data_center_id(DC_DEMO_CLIENT_DC);
+    let c = IgniteClient::new(cfg);
+
+    // `cache()` only builds a handle — it neither creates nor checks the cache.
+    // Verify the DC-demo cache is actually provisioned so a missing cluster
+    // setup fails here with guidance rather than a cryptic error on first `put`.
+    let names = c.cache_names().await.expect("list cache names");
+    assert!(
+        names.iter().any(|n| n.eq_ignore_ascii_case(DC_DEMO_CACHE)),
+        "cache {DC_DEMO_CACHE:?} not found — start the cluster from local-cluster/ \
+         with `IGNITE_DC_DEMO=1 ./local-cluster/start.sh`. The cache must be \
+         pre-defined with FULL_SYNC + readFromBackup (ignite-config.xml)."
+    );
+    let cache = c.cache(DC_DEMO_CACHE);
+
+    for k in 0..300i32 {
+        cache
+            .put(IgniteValue::Int(k), IgniteValue::Int(k))
+            .await
+            .unwrap_or_else(|e| panic!("put {k} failed: {e}"));
+    }
+    // Reads route via the DC map; for DC2-primary keys this is a DC1 backup.
+    for k in 0..300i32 {
+        let got = cache
+            .get(IgniteValue::Int(k))
+            .await
+            .unwrap_or_else(|e| panic!("get {k} failed: {e}"));
+        assert_eq!(got, IgniteValue::Int(k), "key {k} read back wrong value");
+    }
+}
+
 /// Partition awareness is a pure optimization: results must be identical whether
 /// it is on or off.  Writes go through a PA-on client; reads are verified through
 /// both a PA-on and a PA-off client.

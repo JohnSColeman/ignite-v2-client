@@ -39,18 +39,34 @@ wait_port() { # host port timeout_s
   echo "port $p is up"
 }
 
+# Per-node data-center id, used only in DC-demo mode.  Nodes 1 & 2 → DC1, node
+# 3 → DC2, so for a client with dcId=DC1 every partition has a DC1 owner and the
+# partitions whose primary is node 3 route reads to a DC1 backup.
+dc_id_for() { # index → echoes the DC id (empty unless IGNITE_DC_DEMO is set)
+  [ -n "${IGNITE_DC_DEMO:-}" ] || return 0
+  case "$1" in
+    1 | 2) echo "DC1" ;;
+    *) echo "DC2" ;;
+  esac
+}
+
 start_node() { # index thin_port
   local idx=$1
   local port=$2
   local log="/tmp/ignite-node${idx}.log"
-  echo "starting node-$idx (thin $port) → $log"
+  local dc
+  dc="$(dc_id_for "$idx")"
+  local dc_opt=""
+  [ -n "$dc" ] && dc_opt="-DIGNITE_DATA_CENTER_ID=$dc"
+  echo "starting node-$idx (thin $port${dc:+, dc=$dc}) → $log"
   # IGNITE_WORK_DIR per node avoids any shared-state surprises.
   # JVM options:
   #   - allow DML inside transactions so the thin-client tx test suite works;
   #   - pin the JVM timezone to UTC so SQL DATE values are not normalised to the
-  #     host's local timezone (otherwise temporal WHERE-clause tests fail off-UTC).
+  #     host's local timezone (otherwise temporal WHERE-clause tests fail off-UTC);
+  #   - IGNITE_DATA_CENTER_ID (DC-demo mode only) tags the node's data center.
   IGNITE_WORK_DIR="/tmp/ignite-work-${idx}" \
-  JVM_OPTS="${JVM_OPTS:-} -DIGNITE_ALLOW_DML_INSIDE_TRANSACTION=true -Duser.timezone=UTC" \
+  JVM_OPTS="${JVM_OPTS:-} -DIGNITE_ALLOW_DML_INSIDE_TRANSACTION=true -Duser.timezone=UTC $dc_opt" \
     nohup "$IGNITE_HOME/bin/ignite.sh" "$CFG" >"$log" 2>&1 &
   echo $! >"/tmp/ignite-node${idx}.pid"
   wait_port "$port" 90

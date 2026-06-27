@@ -33,6 +33,17 @@
                     <property name="backups" value="1"/>
                     <property name="atomicityMode" value="ATOMIC"/>
                 </bean>
+                <!-- DC-aware demo cache.  readFromBackup + a non-PRIMARY_SYNC write
+                     mode are required for the server to build the data-center
+                     partition map used by read-from-backup routing. -->
+                <bean class="org.apache.ignite.configuration.CacheConfiguration">
+                    <property name="name" value="DC_DEMO"/>
+                    <property name="cacheMode" value="PARTITIONED"/>
+                    <property name="backups" value="1"/>
+                    <property name="atomicityMode" value="ATOMIC"/>
+                    <property name="readFromBackup" value="true"/>
+                    <property name="writeSynchronizationMode" value="FULL_SYNC"/>
+                </bean>
             </list>
         </property>
 

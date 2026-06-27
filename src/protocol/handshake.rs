@@ -13,6 +13,35 @@ pub const PROTOCOL_MAJOR: i16 = 1;
 pub const PROTOCOL_MINOR: i16 = 7;
 pub const PROTOCOL_PATCH: i16 = 0;
 
+/// Whether the client advertises the `DC_AWARE` protocol feature (bit 22).
+///
+/// When `true`, the server includes a second "data-center" partition map in
+/// `CACHE_PARTITIONS` responses, which the client uses to route read-only ops
+/// to a same-data-center backup owner (Java `OPS_ALLOWED_ON_BACKUPS`).  This
+/// gates the extra fields in the `CACHE_PARTITIONS` request/response codec.
+/// We deliberately do **not** advertise `ALL_AFFINITY_MAPPINGS`.
+pub const ADVERTISE_DC_AWARE: bool = true;
+
+/// Feature bitmask bytes advertised at handshake.  Java encodes the feature set
+/// as a `BitSet` (little-endian): bit 22 (`DC_AWARE`) lives in byte 2, position
+/// 6 → `0x40`.
+fn advertised_feature_bytes() -> Vec<u8> {
+    if ADVERTISE_DC_AWARE {
+        vec![0x00, 0x00, 0x40]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether the server's advertised feature bitmask includes `DC_AWARE` (bit 22).
+/// The negotiated feature is the intersection of what the client advertises and
+/// what the server supports, so the DC-aware `CACHE_PARTITIONS` wire format must
+/// only be used when **both** sides agree — otherwise the server desyncs.
+pub fn server_supports_dc_aware(server_features: &[u8]) -> bool {
+    // bit 22 → byte index 2, bit position 6 (little-endian BitSet).
+    server_features.get(2).is_some_and(|b| b & 0x40 != 0)
+}
+
 #[derive(Debug, Clone)]
 pub struct HandshakeRequest {
     pub username: Option<String>,
@@ -35,10 +64,12 @@ impl HandshakeRequest {
         buf.put_u8(CLIENT_TYPE_THIN);
 
         // Protocol 1.5+ (Ignite 2.8+) requires a feature-flags byte[] here,
-        // inserted between client_code and the auth credentials.
-        // We advertise no optional features: empty byte array (type 12, length 0).
+        // inserted between client_code and the auth credentials.  We advertise
+        // the DC_AWARE feature (see `advertised_feature_bytes`).
+        let features = advertised_feature_bytes();
         buf.put_u8(type_code::BYTE_ARRAY); // BYTE_ARRAY type code
-        buf.put_i32_le(0); // zero length — no feature bits set
+        buf.put_i32_le(features.len() as i32);
+        buf.put_slice(&features);
 
         // Auth credentials follow as nullable byte[] fields:
         //   None  -- type code 101 (NULL)
@@ -175,6 +206,27 @@ mod tests {
         assert!(resp.success);
         assert_eq!(resp.features, vec![0x01, 0x20]);
         assert_eq!(resp.node_id, Some(node));
+    }
+
+    #[test]
+    fn server_dc_aware_negotiation() {
+        assert!(server_supports_dc_aware(&[0x00, 0x00, 0x40]), "bit 22 set");
+        assert!(!server_supports_dc_aware(&[0x00, 0x00, 0x00]), "bit 22 clear");
+        assert!(!server_supports_dc_aware(&[0xFF, 0xFF]), "byte 2 absent");
+        assert!(!server_supports_dc_aware(&[]), "empty features");
+    }
+
+    #[test]
+    fn encode_advertises_dc_aware_feature_bit() {
+        let req = HandshakeRequest::new(None, None);
+        let b = req.encode();
+        // Layout: [u8 op][i16 major][i16 minor][i16 patch][u8 client][u8 BYTE_ARRAY][i32 len][bytes]
+        assert_eq!(b[8], type_code::BYTE_ARRAY);
+        let len = i32::from_le_bytes([b[9], b[10], b[11], b[12]]) as usize;
+        assert!(len >= 3, "feature bitmask should cover bit 22");
+        let feats = &b[13..13 + len];
+        // bit 22 → byte 2, bit position 6 → 0x40
+        assert_eq!(feats[2] & 0x40, 0x40, "DC_AWARE (bit 22) must be advertised");
     }
 
     #[test]

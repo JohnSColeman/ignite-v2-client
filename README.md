@@ -73,7 +73,7 @@ over TCP.
 | Multi-node connection registry (one pool per node, keyed by node UUID) | ✅ |
 | Partition awareness / affinity routing (primary-node routing for KV ops) | ✅ |
 | Server endpoint discovery (auto-learn nodes not in the address list) | ✅ |
-| Backup-node routing for read-only ops | 🔲 Future |
+| Read-from-backup / DC-aware routing for read-only ops (`DC_AWARE`, negotiated) | ✅ |
 
 ---
 
@@ -142,7 +142,7 @@ ignite-client/
 │   ├── functional_query.rs ←  6 SQL query behaviour tests (pagination, mixed KV+SQL, errors)
 │   ├── functional_cache.rs ←  5 KV cache API lifecycle and operation tests
 │   ├── transaction.rs      ←  3 concurrent transaction correctness tests
-│   └── partition_awareness.rs ← 3 affinity-routing tests (roundtrip, discovery, PA-on/off parity)
+│   └── partition_awareness.rs ← 4 affinity-routing tests (roundtrip, discovery, DC read path, parity)
 ├── local-cluster/          ← scripts + config for a local 3-node test cluster
 │   ├── ignite-config.xml   ← static-discovery node config (partitioned cache, thin connector)
 │   ├── start.sh            ← launch 3 nodes on ports 10800/10801/10802
@@ -343,6 +343,7 @@ pub struct IgniteClientConfig {
     pub addresses: Vec<String>,           // all cluster node addresses (for routing)
     pub partition_awareness: Option<bool>,// None = auto (on when ≥ 2 addresses); Some(b) forces it
     pub endpoint_discovery: Option<bool>, // None = auto (on); learn nodes not in `addresses`
+    pub data_center_id: Option<String>,   // this client's DC, for read-from-backup routing
     pub username: Option<String>,
     pub password: Option<String>,
     pub max_pool_size: usize,             // default: 10 (per node)
@@ -358,6 +359,7 @@ impl IgniteClientConfig {
     pub fn with_addresses(self, addresses: Vec<String>) -> Self;   // multi-node cluster
     pub fn with_partition_awareness(self, enabled: bool) -> Self;  // force PA on/off
     pub fn with_endpoint_discovery(self, enabled: bool) -> Self;   // force discovery on/off
+    pub fn with_data_center_id(self, dc_id: impl Into<String>) -> Self;  // DC-aware reads
     pub fn with_auth(self, username, password) -> Self;
     pub fn with_pool_size(self, size: usize) -> Self;
     pub fn with_connect_timeout(self, duration: Duration) -> Self;
@@ -733,6 +735,22 @@ client also asks the cluster for the full set of server node endpoints
 in the configured address list — so you can list a single bootstrap address and
 still route to every node. Toggle with `with_endpoint_discovery(true|false)`.
 
+**Read-from-backup (DC-aware).** Mirroring the Java thin client, read-only ops
+(`get`, `contains_key`) are routed with `primary = false`: when the client and
+server have negotiated the `DC_AWARE` feature **and** the client has a
+data-center id set (`with_data_center_id("DC1")`), the server includes a
+same-data-center partition map in `CACHE_PARTITIONS` responses and reads go to a
+DC-local backup owner; otherwise the DC map equals the primary map and reads go
+to the primary. The feature is negotiated at handshake (the client advertises
+`DC_AWARE`; the DC-aware wire format is used only if the server also supports
+it — `DC_AWARE` landed in Ignite 2.18), so it is a safe no-op against older
+servers. Writes always route to the primary.
+
+This is verified end to end against a 2-data-center cluster: with the client set
+to `dcId = DC1` and nodes split DC1/DC1/DC2, reads of keys whose primary is the
+DC2 node route to a DC1 backup instead — see the `pa_dc_aware_read_path_is_correct`
+test and the [Local cluster](#local-3-node-test-cluster) DC-demo mode.
+
 **Enablement.** Auto-on when two or more addresses are configured; override with
 `with_partition_awareness(true|false)`. Configure the cluster with:
 
@@ -751,7 +769,7 @@ cache.put(IgniteValue::Int(42), IgniteValue::Long(7)).await?; // routed to key 4
 
 Scope: routing currently covers primitive, `String`, and `UUID` keys (the types
 with well-defined, exactly-replicable Java hash codes). Custom affinity-key
-fields are future work.
+field extraction is future work.
 
 ---
 
@@ -862,6 +880,9 @@ Covers:
     parsing, and response-header topology-version capture
   - endpoint discovery (`src/discovery.rs`): `CLUSTER_GROUP_GET_NODE_ENDPOINTS`
     (opcode 5102) request/response codec and typed-string/raw-UUID readers
+  - `DC_AWARE` negotiation + read-from-backup routing: handshake feature-bit
+    advertisement/negotiation, DC-aware `CACHE_PARTITIONS` request/response
+    codec, and `affinity_node` primary-vs-backup selection
 
 ### Integration tests (require a live Ignite 2.x node on localhost:10800)
 
@@ -1020,7 +1041,7 @@ Rust port of selected tests from Apache Ignite's `BlockingTxOpsTest.java`.
 
 ---
 
-### `tests/partition_awareness.rs` — 3 tests
+### `tests/partition_awareness.rs` — 4 tests
 
 End-to-end affinity-routing tests. Set `IGNITE_ADDRS` to route across multiple
 nodes; otherwise they run against the single default address.
@@ -1029,6 +1050,7 @@ nodes; otherwise they run against the single default address.
 |---|---|
 | `pa_put_get_roundtrip_is_correct` | A spread of keys `put`/`get` correctly with partition awareness on — the routed write/read path returns every stored value |
 | `pa_endpoint_discovery_reaches_unconfigured_nodes` | Configured with one node + PA forced on, the client discovers the rest of the cluster and still serves every key |
+| `pa_dc_aware_read_path_is_correct` | On a DC-demo cluster (`IGNITE_DC_DEMO=1`), exercises the DC read path with the client's `dcId = DC1` (request carries the dcId, DC partition map is decoded, reads route through it) and asserts correct values |
 | `pa_on_and_off_agree` | Reading the same keys through a PA-on and a PA-off client yields identical results (the fail-safe guarantee: routing never changes observable results) |
 
 Enable `RUST_LOG=ignite_client=debug` to see routing decisions, e.g.
@@ -1061,6 +1083,19 @@ export IGNITE_HOME=/path/to/apache-ignite-x.y.z-bin
 sets `-DIGNITE_ALLOW_DML_INSIDE_TRANSACTION=true` and `-Duser.timezone=UTC` so the
 full integration suite — including the transaction and temporal tests — passes.
 Logs are written to `/tmp/ignite-node{1,2,3}.log`.
+
+**DC-demo mode.** Set `IGNITE_DC_DEMO=1` to start a 2-data-center cluster (nodes
+1 & 2 → `DC1`, node 3 → `DC2`, via `-DIGNITE_DATA_CENTER_ID`). Combined with the
+pre-defined `DC_DEMO` cache (`FULL_SYNC` + `readFromBackup`) and a client
+`dcId = DC1`, this drives the DC read path in `pa_dc_aware_read_path_is_correct`
+(reads of DC2-primary keys route to a DC1 backup). Requires Ignite ≥ 2.18 (when
+`DC_AWARE` was added):
+
+```bash
+IGNITE_DC_DEMO=1 ./local-cluster/start.sh
+cargo test --test partition_awareness pa_dc_aware_read_path_is_correct \
+  -- --test-threads=1
+```
 
 Run the complete suite against it:
 

@@ -101,15 +101,16 @@ impl IgniteCache {
         }
     }
 
-    /// Resolve the primary node owning `key`, lazily refreshing the affinity
-    /// mapping first.  Returns `None` (route to the default channel) for
+    /// Resolve the node owning `key`, lazily refreshing the affinity mapping
+    /// first.  `primary = false` (read-only ops) may resolve to a same-data
+    /// centre backup owner.  Returns `None` (route to the default channel) for
     /// transactional handles, when PA is disabled, or for unsupported keys.
-    async fn route(&self, key: &IgniteValue) -> Option<Uuid> {
+    async fn route(&self, key: &IgniteValue, primary: bool) -> Option<Uuid> {
         match &self.source {
             CacheSource::Tx { .. } => None,
             CacheSource::Routed { registry, affinity } => {
                 registry.ensure_affinity(affinity, self.cache_id).await;
-                affinity.affinity_node(self.cache_id, key)
+                affinity.affinity_node(self.cache_id, key, primary)
             }
         }
     }
@@ -141,7 +142,8 @@ impl IgniteCache {
     /// Retrieve a value by key.  Returns `IgniteValue::Null` if the key is not present.
     pub async fn get(&self, key: IgniteValue) -> Result<IgniteValue> {
         let req_id = next_request_id();
-        let target = self.route(&key).await;
+        // Read-only op: a same-DC backup owner is acceptable.
+        let target = self.route(&key, false).await;
         let payload = encode_cache_key_req(
             op_code::CACHE_GET,
             req_id,
@@ -157,7 +159,7 @@ impl IgniteCache {
     #[must_use = "futures do nothing unless you `.await` them"]
     pub async fn put(&self, key: IgniteValue, value: IgniteValue) -> Result<()> {
         let req_id = next_request_id();
-        let target = self.route(&key).await;
+        let target = self.route(&key, true).await;
         let payload = encode_cache_kv_req(
             op_code::CACHE_PUT,
             req_id,
@@ -174,7 +176,7 @@ impl IgniteCache {
     /// Returns `true` if the value was stored, `false` if the key already existed.
     pub async fn put_if_absent(&self, key: IgniteValue, value: IgniteValue) -> Result<bool> {
         let req_id = next_request_id();
-        let target = self.route(&key).await;
+        let target = self.route(&key, true).await;
         let payload = encode_cache_kv_req(
             op_code::CACHE_PUT_IF_ABSENT,
             req_id,
@@ -221,7 +223,8 @@ impl IgniteCache {
     /// Returns `true` if the cache contains the given key.
     pub async fn contains_key(&self, key: IgniteValue) -> Result<bool> {
         let req_id = next_request_id();
-        let target = self.route(&key).await;
+        // Read-only op: a same-DC backup owner is acceptable.
+        let target = self.route(&key, false).await;
         let payload = encode_cache_key_req(
             op_code::CACHE_CONTAINS_KEY,
             req_id,
@@ -249,7 +252,7 @@ impl IgniteCache {
     /// Returns `true` if the value was replaced, `false` if the key was absent.
     pub async fn replace(&self, key: IgniteValue, value: IgniteValue) -> Result<bool> {
         let req_id = next_request_id();
-        let target = self.route(&key).await;
+        let target = self.route(&key, true).await;
         let payload = encode_cache_kv_req(
             op_code::CACHE_REPLACE,
             req_id,
@@ -266,7 +269,7 @@ impl IgniteCache {
     /// Returns `IgniteValue::Null` if the key was not previously present.
     pub async fn get_and_put(&self, key: IgniteValue, value: IgniteValue) -> Result<IgniteValue> {
         let req_id = next_request_id();
-        let target = self.route(&key).await;
+        let target = self.route(&key, true).await;
         let payload = encode_cache_kv_req(
             op_code::CACHE_GET_AND_PUT,
             req_id,
@@ -283,7 +286,7 @@ impl IgniteCache {
     /// Returns `IgniteValue::Null` if the key was not present.
     pub async fn get_and_remove(&self, key: IgniteValue) -> Result<IgniteValue> {
         let req_id = next_request_id();
-        let target = self.route(&key).await;
+        let target = self.route(&key, true).await;
         let payload = encode_cache_key_req(
             op_code::CACHE_GET_AND_REMOVE,
             req_id,
@@ -303,7 +306,7 @@ impl IgniteCache {
         value: IgniteValue,
     ) -> Result<IgniteValue> {
         let req_id = next_request_id();
-        let target = self.route(&key).await;
+        let target = self.route(&key, true).await;
         let payload = encode_cache_kv_req(
             op_code::CACHE_GET_AND_REPLACE,
             req_id,
