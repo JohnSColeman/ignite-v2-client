@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::protocol::IgniteValue;
+use crate::protocol::{ExpiryPolicy, IgniteValue};
 use crate::protocol::codec::read_bool;
 use crate::protocol::messages::{
     decode_cache_get_all_response, decode_cache_get_size_response, decode_cache_value_response,
@@ -49,22 +49,23 @@ pub(crate) enum CacheSource {
 pub struct IgniteCache {
     pub(crate) cache_id: i32,
     source: CacheSource,
+    /// Optional expiry policy applied to every operation on this handle.
+    expiry: Option<ExpiryPolicy>,
 }
 
 impl std::fmt::Debug for IgniteCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let kind = match &self.source {
-            CacheSource::Routed { .. } => "routed",
-            CacheSource::Tx { tx_id, .. } => return f
-                .debug_struct("IgniteCache")
-                .field("cache_id", &self.cache_id)
-                .field("tx_id", tx_id)
-                .finish(),
-        };
-        f.debug_struct("IgniteCache")
-            .field("cache_id", &self.cache_id)
-            .field("source", &kind)
-            .finish()
+        let mut s = f.debug_struct("IgniteCache");
+        s.field("cache_id", &self.cache_id);
+        match &self.source {
+            CacheSource::Routed { .. } => {
+                s.field("source", &"routed");
+            }
+            CacheSource::Tx { tx_id, .. } => {
+                s.field("tx_id", tx_id);
+            }
+        }
+        s.field("expiry", &self.expiry).finish()
     }
 }
 
@@ -79,6 +80,7 @@ impl IgniteCache {
         Self {
             cache_id,
             source: CacheSource::Routed { registry, affinity },
+            expiry: None,
         }
     }
 
@@ -88,6 +90,30 @@ impl IgniteCache {
         Self {
             cache_id,
             source: CacheSource::Tx { tx_id, conn },
+            expiry: None,
+        }
+    }
+
+    /// Return a new handle to the same cache whose operations apply `policy`
+    /// (per-entry time-to-live on create / update / access).  Cheap to clone.
+    ///
+    /// ```no_run
+    /// # use ignite_client::{IgniteCache, ExpiryPolicy, ExpiryDuration, IgniteValue};
+    /// # async fn f(cache: IgniteCache) -> ignite_client::Result<()> {
+    /// // New entries live 60s; updates and reads leave the TTL unchanged.
+    /// let ttl = ExpiryPolicy::new(
+    ///     ExpiryDuration::Millis(60_000),
+    ///     ExpiryDuration::Unchanged,
+    ///     ExpiryDuration::Unchanged,
+    /// );
+    /// cache.with_expiry_policy(ttl).put(IgniteValue::Int(1), IgniteValue::Int(2)).await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn with_expiry_policy(&self, policy: ExpiryPolicy) -> IgniteCache {
+        IgniteCache {
+            cache_id: self.cache_id,
+            source: self.source.clone(),
+            expiry: Some(policy),
         }
     }
 
@@ -99,6 +125,11 @@ impl IgniteCache {
             CacheSource::Routed { .. } => None,
             CacheSource::Tx { tx_id, .. } => Some(*tx_id),
         }
+    }
+
+    /// The expiry policy applied to this handle's operations, if any.
+    fn expiry(&self) -> Option<&ExpiryPolicy> {
+        self.expiry.as_ref()
     }
 
     /// Resolve the node owning `key`, lazily refreshing the affinity mapping
@@ -150,6 +181,7 @@ impl IgniteCache {
             self.cache_id,
             &key,
             self.tx_id(),
+            self.expiry(),
         );
         let mut resp = self.send(req_id, payload, target).await?;
         decode_cache_value_response(&mut resp).map_err(IgniteError::Protocol)
@@ -167,6 +199,7 @@ impl IgniteCache {
             &key,
             &value,
             self.tx_id(),
+            self.expiry(),
         );
         self.send(req_id, payload, target).await?;
         Ok(())
@@ -184,6 +217,7 @@ impl IgniteCache {
             &key,
             &value,
             self.tx_id(),
+            self.expiry(),
         );
         let mut resp = self.send(req_id, payload, target).await?;
         read_bool(&mut resp).map_err(IgniteError::Protocol)
@@ -199,6 +233,7 @@ impl IgniteCache {
             self.cache_id,
             &keys,
             self.tx_id(),
+            self.expiry(),
         );
         // Multi-key requests span partitions; route via the default channel.
         let mut resp = self.send(req_id, payload, None).await?;
@@ -215,6 +250,7 @@ impl IgniteCache {
             self.cache_id,
             &entries,
             self.tx_id(),
+            self.expiry(),
         );
         self.send(req_id, payload, None).await?;
         Ok(())
@@ -231,6 +267,7 @@ impl IgniteCache {
             self.cache_id,
             &key,
             self.tx_id(),
+            self.expiry(),
         );
         let mut resp = self.send(req_id, payload, target).await?;
         read_bool(&mut resp).map_err(IgniteError::Protocol)
@@ -260,6 +297,7 @@ impl IgniteCache {
             &key,
             &value,
             self.tx_id(),
+            self.expiry(),
         );
         let mut resp = self.send(req_id, payload, target).await?;
         read_bool(&mut resp).map_err(IgniteError::Protocol)
@@ -277,6 +315,7 @@ impl IgniteCache {
             &key,
             &value,
             self.tx_id(),
+            self.expiry(),
         );
         let mut resp = self.send(req_id, payload, target).await?;
         decode_cache_value_response(&mut resp).map_err(IgniteError::Protocol)
@@ -293,6 +332,7 @@ impl IgniteCache {
             self.cache_id,
             &key,
             self.tx_id(),
+            self.expiry(),
         );
         let mut resp = self.send(req_id, payload, target).await?;
         decode_cache_value_response(&mut resp).map_err(IgniteError::Protocol)
@@ -314,6 +354,7 @@ impl IgniteCache {
             &key,
             &value,
             self.tx_id(),
+            self.expiry(),
         );
         let mut resp = self.send(req_id, payload, target).await?;
         decode_cache_value_response(&mut resp).map_err(IgniteError::Protocol)
@@ -336,7 +377,7 @@ impl IgniteCache {
     pub async fn get_size(&self) -> Result<i64> {
         let req_id = next_request_id();
         let payload =
-            encode_cache_get_size(op_code::CACHE_GET_SIZE, req_id, self.cache_id, self.tx_id());
+            encode_cache_get_size(op_code::CACHE_GET_SIZE, req_id, self.cache_id, self.tx_id(), self.expiry());
         let mut resp = self.send(req_id, payload, None).await?;
         decode_cache_get_size_response(&mut resp).map_err(IgniteError::Protocol)
     }

@@ -17,7 +17,7 @@ use super::codec::{
     write_bool, write_string, write_string_nullable,
 };
 use super::error::{ProtocolError, Result};
-use super::types::{IgniteValue, StatementType, TxConcurrency, TxIsolation};
+use super::types::{ExpiryPolicy, IgniteValue, StatementType, TxConcurrency, TxIsolation};
 
 // ─── Response / request flag constants ───────────────────────────────────────
 
@@ -27,6 +27,8 @@ const FLAG_TOPOLOGY: i16 = 0x02;
 const FLAG_ERROR: i16 = 0x01;
 /// Cache / SQL request flag: the request is part of an active transaction.
 const CACHE_FLAG_TX: u8 = 0x02;
+/// Cache request flag: an expiry policy (three durations) follows the flags byte.
+const CACHE_FLAG_WITH_EXPIRY: u8 = 0x04;
 
 // ─── Request header ───────────────────────────────────────────────────────────
 
@@ -320,14 +322,34 @@ pub fn encode_tx_end(op_code: i16, request_id: i64, tx_id: i32, committed: bool)
 // ─── Cache operations ─────────────────────────────────────────────────────────
 
 /// Write the common cache-op header:
-/// `[i16: op_code][i64: req_id][i32: cache_id][u8: flags][i32: tx_id?]`
+/// `[i16: op_code][i64: req_id][i32: cache_id][u8: flags]([i64×3: expiry])?([i32: tx_id])?`
 ///
-/// `flags` is `0x02` when `tx_id` is `Some`, `0x00` otherwise.
-/// When `tx_id` is present the `[i32: tx_id]` is written immediately after the flags byte.
-fn write_cache_header(buf: &mut BytesMut, op: i16, req_id: i64, cache_id: i32, tx_id: Option<i32>) {
+/// `flags` sets `0x04` when an `expiry` policy is present and `0x02` when `tx_id`
+/// is present.  Matching Java `TcpClientCache.writeCacheInfo`, the three expiry
+/// durations (create, update, access) are written **before** the `tx_id`.
+fn write_cache_header(
+    buf: &mut BytesMut,
+    op: i16,
+    req_id: i64,
+    cache_id: i32,
+    tx_id: Option<i32>,
+    expiry: Option<&ExpiryPolicy>,
+) {
     write_request_header(buf, op, req_id);
     buf.put_i32_le(cache_id);
-    buf.put_u8(if tx_id.is_some() { CACHE_FLAG_TX } else { 0x00 });
+    let mut flags = 0u8;
+    if expiry.is_some() {
+        flags |= CACHE_FLAG_WITH_EXPIRY;
+    }
+    if tx_id.is_some() {
+        flags |= CACHE_FLAG_TX;
+    }
+    buf.put_u8(flags);
+    if let Some(p) = expiry {
+        buf.put_i64_le(p.create.to_wire());
+        buf.put_i64_le(p.update.to_wire());
+        buf.put_i64_le(p.access.to_wire());
+    }
     if let Some(id) = tx_id {
         buf.put_i32_le(id);
     }
@@ -340,9 +362,10 @@ pub fn encode_cache_key_req(
     cache_id: i32,
     key: &IgniteValue,
     tx_id: Option<i32>,
+    expiry: Option<&ExpiryPolicy>,
 ) -> Bytes {
     let mut buf = BytesMut::new();
-    write_cache_header(&mut buf, op, req_id, cache_id, tx_id);
+    write_cache_header(&mut buf, op, req_id, cache_id, tx_id, expiry);
     encode_value(&mut buf, key);
     buf.freeze()
 }
@@ -355,9 +378,10 @@ pub fn encode_cache_kv_req(
     key: &IgniteValue,
     val: &IgniteValue,
     tx_id: Option<i32>,
+    expiry: Option<&ExpiryPolicy>,
 ) -> Bytes {
     let mut buf = BytesMut::new();
-    write_cache_header(&mut buf, op, req_id, cache_id, tx_id);
+    write_cache_header(&mut buf, op, req_id, cache_id, tx_id, expiry);
     encode_value(&mut buf, key);
     encode_value(&mut buf, val);
     buf.freeze()
@@ -370,9 +394,10 @@ pub fn encode_cache_multi_key_req(
     cache_id: i32,
     keys: &[IgniteValue],
     tx_id: Option<i32>,
+    expiry: Option<&ExpiryPolicy>,
 ) -> Bytes {
     let mut buf = BytesMut::new();
-    write_cache_header(&mut buf, op, req_id, cache_id, tx_id);
+    write_cache_header(&mut buf, op, req_id, cache_id, tx_id, expiry);
     debug_assert!(
         keys.len() <= i32::MAX as usize,
         "too many keys for wire format"
@@ -391,9 +416,10 @@ pub fn encode_cache_multi_kv_req(
     cache_id: i32,
     entries: &[(IgniteValue, IgniteValue)],
     tx_id: Option<i32>,
+    expiry: Option<&ExpiryPolicy>,
 ) -> Bytes {
     let mut buf = BytesMut::new();
-    write_cache_header(&mut buf, op, req_id, cache_id, tx_id);
+    write_cache_header(&mut buf, op, req_id, cache_id, tx_id, expiry);
     debug_assert!(
         entries.len() <= i32::MAX as usize,
         "too many entries for wire format"
@@ -408,9 +434,15 @@ pub fn encode_cache_multi_kv_req(
 
 /// Encode a `CACHE_GET_SIZE` (1055) request.
 /// Payload after the cache header: `[i32: peek_mode_count=0]` (0 = use all partitions).
-pub fn encode_cache_get_size(op: i16, req_id: i64, cache_id: i32, tx_id: Option<i32>) -> Bytes {
+pub fn encode_cache_get_size(
+    op: i16,
+    req_id: i64,
+    cache_id: i32,
+    tx_id: Option<i32>,
+    expiry: Option<&ExpiryPolicy>,
+) -> Bytes {
     let mut buf = BytesMut::new();
-    write_cache_header(&mut buf, op, req_id, cache_id, tx_id);
+    write_cache_header(&mut buf, op, req_id, cache_id, tx_id, expiry);
     buf.put_i32_le(0); // 0 peek modes → all partitions
     buf.freeze()
 }
@@ -523,6 +555,7 @@ pub fn decode_cache_names_response(buf: &mut Bytes) -> super::error::Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::op_code;
 
     #[test]
     fn sql_fields_request_encodes() {
@@ -530,6 +563,70 @@ mod tests {
         let bytes = req.encode(2004, 1);
         // Should at minimum have: i16 opcode + i64 req_id + i32 cache_id + ...
         assert!(bytes.len() > 14);
+    }
+
+    #[test]
+    fn cache_kv_req_with_expiry_writes_flag_and_durations() {
+        use crate::protocol::types::ExpiryDuration;
+        let policy = ExpiryPolicy::new(
+            ExpiryDuration::Millis(1000),
+            ExpiryDuration::Unchanged,
+            ExpiryDuration::Eternal,
+        );
+        let bytes = encode_cache_kv_req(
+            op_code::CACHE_PUT,
+            5,
+            100,
+            &IgniteValue::Int(1),
+            &IgniteValue::Int(2),
+            None,
+            Some(&policy),
+        );
+        let mut b = bytes.clone();
+        assert_eq!(b.get_i16_le(), op_code::CACHE_PUT);
+        assert_eq!(b.get_i64_le(), 5); // req id
+        assert_eq!(b.get_i32_le(), 100); // cache id
+        assert_eq!(b.get_u8(), 0x04); // WITH_EXPIRY flag, no tx
+        assert_eq!(b.get_i64_le(), 1000); // create
+        assert_eq!(b.get_i64_le(), -2); // update = unchanged
+        assert_eq!(b.get_i64_le(), -1); // access = eternal
+        // key + value typed-values follow (INT type code = 3)
+        assert_eq!(b.get_u8(), 3);
+    }
+
+    #[test]
+    fn cache_req_expiry_durations_precede_tx_id() {
+        use crate::protocol::types::ExpiryDuration;
+        let policy = ExpiryPolicy::new(
+            ExpiryDuration::Immediate,
+            ExpiryDuration::Immediate,
+            ExpiryDuration::Immediate,
+        );
+        let bytes =
+            encode_cache_key_req(op_code::CACHE_GET, 9, 42, &IgniteValue::Int(1), Some(7), Some(&policy));
+        let mut b = bytes.clone();
+        assert_eq!(b.get_i16_le(), op_code::CACHE_GET);
+        assert_eq!(b.get_i64_le(), 9);
+        assert_eq!(b.get_i32_le(), 42);
+        assert_eq!(b.get_u8(), 0x04 | 0x02); // expiry + tx
+        // expiry durations first ...
+        assert_eq!(b.get_i64_le(), 0);
+        assert_eq!(b.get_i64_le(), 0);
+        assert_eq!(b.get_i64_le(), 0);
+        // ... then tx id
+        assert_eq!(b.get_i32_le(), 7);
+    }
+
+    #[test]
+    fn cache_req_no_expiry_omits_durations() {
+        let bytes =
+            encode_cache_key_req(op_code::CACHE_GET, 1, 10, &IgniteValue::Int(1), None, None);
+        let mut b = bytes.clone();
+        assert_eq!(b.get_i16_le(), op_code::CACHE_GET);
+        assert_eq!(b.get_i64_le(), 1);
+        assert_eq!(b.get_i32_le(), 10);
+        assert_eq!(b.get_u8(), 0x00); // no flags
+        assert_eq!(b.get_u8(), 3); // straight to the key (INT type code)
     }
 
     #[test]

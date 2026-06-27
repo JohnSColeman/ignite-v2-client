@@ -4,12 +4,15 @@ An async Rust thin client for **Apache Ignite 2.x**, implementing the
 [Ignite Binary Client Protocol](https://ignite.apache.org/docs/latest/thin-clients/getting-started-with-thin-clients)
 over TCP.
 
-> **New in 0.3.0 — Partition awareness / affinity routing.** The client now
-> connects to every configured cluster node, computes each key's primary node
-> locally, and sends cache operations straight to it — eliminating the
-> server-side proxy hop. It is a pure optimization with a fail-safe fallback to
-> the default channel, so results never change. See
-> [Partition awareness](#partition-awareness).
+> **New in 0.4.0 — Cache entry TTL / expiry.** Attach a per-entry lifetime to
+> any cache handle with `cache.with_expiry_policy(...)`: entries can expire a
+> configurable time after creation, update, or access. See [Expiry / TTL](#expiry--ttl).
+>
+> **New in 0.3.0 — Partition awareness / affinity routing.** The client connects
+> to every configured cluster node, computes each key's primary node locally,
+> and sends cache operations straight to it — eliminating the server-side proxy
+> hop. A pure optimization with a fail-safe fallback to the default channel, so
+> results never change. See [Partition awareness](#partition-awareness).
 
 ---
 
@@ -25,6 +28,7 @@ over TCP.
   - [Transaction](#transaction-1)
   - [Transaction helper (auto-commit/rollback)](#transaction-helper-auto-commitrollback)
   - [KV cache](#kv-cache)
+  - [Expiry / TTL](#expiry--ttl)
   - [Streaming cursor](#streaming-cursor)
   - [TLS](#tls)
   - [Authentication](#authentication)
@@ -66,6 +70,7 @@ over TCP.
 | deadpool connection pool | ✅ |
 | Full wire type coverage (Null, Bool, Byte…Long, Float, Double, String, UUID, Date, Time, Timestamp, Decimal, arrays) | ✅ |
 | KV cache API (get, put, get_all, put_all, contains_key, remove, replace, …) | ✅ |
+| Cache entry TTL / expiry policies (create / update / access) | ✅ |
 | TLS (`rustls` + native system CA bundle) | ✅ |
 | Streaming `QueryStream` cursor | ✅ |
 | TCP keepalive | ✅ |
@@ -114,7 +119,7 @@ ignite-client/
 │   ├── lib.rs              ← public re-exports
 │   ├── client.rs           ← IgniteClient: query, execute, begin_transaction, cache, …
 │   ├── transaction.rs      ← Transaction: query, execute, commit, rollback, cache, drop
-│   ├── cache.rs            ← IgniteCache: get, put, get_all, put_all, remove, … (affinity-routed)
+│   ├── cache.rs            ← IgniteCache: get, put, get_all, put_all, remove, … (affinity-routed); with_expiry_policy
 │   ├── affinity.rs         ← partition awareness: key hashing, rendezvous partition/mask,
 │   │                          CACHE_PARTITIONS codec, AffinityContext (mappings + refresh)
 │   ├── channel.rs          ← ChannelRegistry: one pool per node, node-UUID→pool routing,
@@ -142,7 +147,8 @@ ignite-client/
 │   ├── functional_query.rs ←  6 SQL query behaviour tests (pagination, mixed KV+SQL, errors)
 │   ├── functional_cache.rs ←  5 KV cache API lifecycle and operation tests
 │   ├── transaction.rs      ←  3 concurrent transaction correctness tests
-│   └── partition_awareness.rs ← 4 affinity-routing tests (roundtrip, discovery, DC read path, parity)
+│   ├── partition_awareness.rs ← 4 affinity-routing tests (roundtrip, discovery, DC read path, parity)
+│   └── expiry.rs           ←  3 TTL tests (creation / update / access expiry)
 ├── local-cluster/          ← scripts + config for a local 3-node test cluster
 │   ├── ignite-config.xml   ← static-discovery node config (partitioned cache, thin connector)
 │   ├── start.sh            ← launch 3 nodes on ports 10800/10801/10802
@@ -297,6 +303,43 @@ cache.put(IgniteValue::Int(1), IgniteValue::String("hello".into())).await?;
 let val = cache.get(IgniteValue::Int(1)).await?;
 println!("{:?}", val); // String("hello")
 ```
+
+### Expiry / TTL
+
+`cache.with_expiry_policy(policy)` returns a new handle whose operations apply a
+per-entry time-to-live. The policy carries three independent durations — applied
+when an entry is **created**, **updated** (overwritten), and **accessed** (read)
+— each one of `Eternal`, `Immediate`, `Millis(n)`, or `Unchanged` (leave the
+entry's current lifetime alone).
+
+```rust,ignore
+use ignite_client::{ExpiryPolicy, ExpiryDuration};
+use std::time::Duration;
+
+let cache = client.get_or_create_cache("SESSIONS").await?;
+
+// New entries live 30 minutes; reads/updates don't change that.
+let ttl = ExpiryPolicy::new(
+    ExpiryDuration::from_duration(Duration::from_secs(30 * 60)), // create
+    ExpiryDuration::Unchanged,                                   // update
+    ExpiryDuration::Unchanged,                                   // access
+);
+cache.with_expiry_policy(ttl)
+    .put(IgniteValue::String("token".into()), IgniteValue::Int(42))
+    .await?;
+
+// A "sliding" session: every read extends the lifetime by 30 minutes.
+let sliding = ExpiryPolicy::new(
+    ExpiryDuration::Eternal,
+    ExpiryDuration::Unchanged,
+    ExpiryDuration::from_duration(Duration::from_secs(30 * 60)),
+);
+let v = cache.with_expiry_policy(sliding).get(IgniteValue::String("token".into())).await?;
+```
+
+Requires the server's `EXPIRY_POLICY` feature (protocol ≥ 1.6, always available
+on the 1.7 servers this client targets). The base handle (no policy) uses the
+cache's configured default.
 
 ### Streaming cursor
 
@@ -492,8 +535,44 @@ impl IgniteCache {
     pub async fn get_and_replace(&self, key: IgniteValue, value: IgniteValue) -> Result<IgniteValue>;
     pub async fn remove_all(&self, keys: Vec<IgniteValue>) -> Result<()>;
     pub async fn get_size(&self) -> Result<i64>;
+
+    /// New handle whose operations apply `policy` (per-entry TTL). Cheap to clone.
+    pub fn with_expiry_policy(&self, policy: ExpiryPolicy) -> IgniteCache;
 }
 ```
+
+Expiry policy types:
+
+```rust,ignore
+/// TTL applied for one event (create / update / access).
+pub enum ExpiryDuration {
+    Unchanged,      // leave the entry's current expiry alone (wire -2)
+    Eternal,        // never expires (wire -1)
+    Immediate,      // expire at once (wire 0)
+    Millis(u64),    // time-to-live in milliseconds (wire > 0)
+}
+
+impl ExpiryDuration {
+    /// From a `std::time::Duration` (zero → `Immediate`).
+    pub fn from_duration(d: std::time::Duration) -> Self;
+}
+
+/// Per-entry lifetime applied on create, update, and access.
+pub struct ExpiryPolicy {
+    pub create: ExpiryDuration,
+    pub update: ExpiryDuration,
+    pub access: ExpiryDuration,
+}
+
+impl ExpiryPolicy {
+    pub fn new(create: ExpiryDuration, update: ExpiryDuration, access: ExpiryDuration) -> Self;
+}
+```
+
+The three durations map directly to JCache's `getExpiryForCreation` /
+`Update` / `Access`, but use plain Rust naming. `with_expiry_policy` mirrors the
+Java thin client's `withExpirePolicy`; the policy rides in the cache-op header
+(flag `0x04` + three `i64` durations).
 
 ### QueryResult / Row
 
@@ -690,7 +769,7 @@ the request straight to it. The design mirrors the Java thin client
 (`org.apache.ignite.internal.client.thin`):
 
 ```
-        ┌──────────────── IgniteClient ────────────────┐
+        ┌──────────────── IgniteClient ─────────────────┐
         │  AffinityContext (Arc-shared)                 │
         │   • partition → primary-node UUID mappings    │
         │   • topology version + single-flight refresh  │
@@ -700,7 +779,7 @@ the request straight to it. The design mirrors the Java thin client
    key ─▶ affinity_hash(key) ─▶ partition(hash, mask, parts) ─▶ node UUID
                           │
                           ▼
-        ┌──────────── ChannelRegistry ─────────────┐
+        ┌──────────── ChannelRegistry ──────────────┐
         │  pool[node-1]  pool[node-2]  pool[node-3] │  ← one deadpool pool per node
         │  node UUID → pool index (learned)         │
         └───────────────────────────────────────────┘
@@ -869,6 +948,8 @@ Covers:
 - `java_hash()` against known Java reference values
 - `SqlFieldsRequest` encode/decode
 - Transaction start/end encoding
+- Expiry policy: `ExpiryDuration` wire sentinels (-2/-1/0/ms) and the
+  cache-header expiry flag + durations (ordered before `tx_id`)
 - **Partition awareness** (`src/affinity.rs`, `src/channel.rs`):
   - `affinity_hash()` JVM `hashCode` golden vectors per key type (Int, Long,
     Bool, Byte/Short/Char, String, UUID) and unsupported-kind fallback
@@ -937,6 +1018,7 @@ cargo test --test functional_query   -- --nocapture --test-threads=1
 cargo test --test functional_cache   -- --nocapture --test-threads=1
 cargo test --test transaction        -- --nocapture --test-threads=1
 cargo test --test partition_awareness -- --nocapture --test-threads=1
+cargo test --test expiry             -- --nocapture --test-threads=1
 ```
 
 > **Windows note:** If Windows Smart App Control blocks newly compiled test
@@ -1055,6 +1137,18 @@ nodes; otherwise they run against the single default address.
 
 Enable `RUST_LOG=ignite_client=debug` to see routing decisions, e.g.
 `fetched cache partitions cache_id=… version=… mappings=… applicable=…`.
+
+---
+
+### `tests/expiry.rs` — 3 tests
+
+Cache entry TTL behaviour against a live node (any cluster — TTL is per-operation).
+
+| Test | What it verifies |
+|---|---|
+| `expiry_creation_ttl` | A freshly inserted entry is gone after its creation TTL elapses |
+| `expiry_update_ttl` | An eternal entry only starts expiring once overwritten (update TTL) |
+| `expiry_access_ttl` | Reading an entry through an access-TTL handle sets its lifetime |
 
 ---
 

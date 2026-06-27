@@ -6,6 +6,6 @@ pub mod types;
 
 pub use error::ProtocolError;
 pub use types::{
-    ColumnType, IgniteValue, StatementType, TxConcurrency, TxIsolation, cache_id, java_hash,
-    op_code,
+    ColumnType, ExpiryDuration, ExpiryPolicy, IgniteValue, StatementType, TxConcurrency,
+    TxIsolation, cache_id, java_hash, op_code,
 };

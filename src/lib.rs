@@ -23,5 +23,6 @@ pub use transaction::Transaction;
 
 // Re-export core value types for convenience
 pub use protocol::{
-    IgniteValue, ProtocolError, StatementType, TxConcurrency, TxIsolation, cache_id, java_hash,
+    ExpiryDuration, ExpiryPolicy, IgniteValue, ProtocolError, StatementType, TxConcurrency,
+    TxIsolation, cache_id, java_hash,
 };

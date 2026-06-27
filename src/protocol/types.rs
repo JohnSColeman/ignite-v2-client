@@ -82,6 +82,74 @@ pub mod op_code {
     pub const TX_END: i16 = 4001;
 }
 
+// ─── Expiry / TTL ─────────────────────────────────────────────────────────────
+
+/// Lifetime applied to a cache entry by an [`ExpiryPolicy`] for one event
+/// (creation, update, or access).
+///
+/// Maps to the Ignite thin-client duration encoding: `Unchanged` = -2 (leave the
+/// entry's current expiry untouched), `Eternal` = -1 (never expires),
+/// `Immediate` = 0 (expire at once), `Millis(n)` = a positive time-to-live in
+/// milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiryDuration {
+    /// Leave the entry's current expiry unchanged for this event.
+    Unchanged,
+    /// The entry never expires.
+    Eternal,
+    /// The entry expires immediately.
+    Immediate,
+    /// The entry expires after this many milliseconds.
+    Millis(u64),
+}
+
+impl ExpiryDuration {
+    /// Build from a [`std::time::Duration`]; a zero duration becomes
+    /// [`ExpiryDuration::Immediate`].
+    pub fn from_duration(d: std::time::Duration) -> Self {
+        let ms = d.as_millis();
+        if ms == 0 {
+            ExpiryDuration::Immediate
+        } else {
+            ExpiryDuration::Millis(ms.min(i64::MAX as u128) as u64)
+        }
+    }
+
+    /// Encode to the thin-client wire value (`-2`, `-1`, `0`, or `>0` ms).
+    pub(crate) fn to_wire(self) -> i64 {
+        match self {
+            ExpiryDuration::Unchanged => -2,
+            ExpiryDuration::Eternal => -1,
+            ExpiryDuration::Immediate => 0,
+            ExpiryDuration::Millis(n) => n.min(i64::MAX as u64) as i64,
+        }
+    }
+}
+
+/// Per-entry lifetime policy: the time-to-live applied when an entry is created,
+/// updated, and accessed.  Attach it to a cache handle with
+/// [`crate::IgniteCache::with_expiry_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiryPolicy {
+    /// TTL set when a new entry is inserted.
+    pub create: ExpiryDuration,
+    /// TTL reset when an existing entry is overwritten.
+    pub update: ExpiryDuration,
+    /// TTL reset when an entry is read.
+    pub access: ExpiryDuration,
+}
+
+impl ExpiryPolicy {
+    /// Full control over all three durations.
+    pub fn new(create: ExpiryDuration, update: ExpiryDuration, access: ExpiryDuration) -> Self {
+        Self {
+            create,
+            update,
+            access,
+        }
+    }
+}
+
 // ─── Transaction enums ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,5 +370,27 @@ mod tests {
     fn node_endpoints_opcode_matches_java() {
         // ClientOperation.CLUSTER_GROUP_GET_NODE_ENDPOINTS(5102).
         assert_eq!(op_code::CLUSTER_GROUP_GET_NODE_ENDPOINTS, 5102);
+    }
+
+    #[test]
+    fn expiry_duration_to_wire_sentinels() {
+        // Java PlatformExpiryPolicy: UNCHANGED=-2, ETERNAL=-1, ZERO=0, ms>0.
+        assert_eq!(ExpiryDuration::Unchanged.to_wire(), -2);
+        assert_eq!(ExpiryDuration::Eternal.to_wire(), -1);
+        assert_eq!(ExpiryDuration::Immediate.to_wire(), 0);
+        assert_eq!(ExpiryDuration::Millis(60_000).to_wire(), 60_000);
+    }
+
+    #[test]
+    fn expiry_duration_from_std_duration() {
+        use std::time::Duration;
+        assert_eq!(
+            ExpiryDuration::from_duration(Duration::from_secs(1)),
+            ExpiryDuration::Millis(1000)
+        );
+        assert_eq!(
+            ExpiryDuration::from_duration(Duration::ZERO),
+            ExpiryDuration::Immediate
+        );
     }
 }
