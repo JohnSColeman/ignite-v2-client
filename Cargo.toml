@@ -1,6 +1,6 @@
 [package]
 name = "ignite-v2-client"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Apache Ignite v2 Client"
 license = "MIT OR Apache-2.0"
@@ -37,6 +37,7 @@ rustls-native-certs = { workspace = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 futures = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]
 workspace = true

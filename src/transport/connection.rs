@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
@@ -11,6 +11,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::protocol::handshake::HandshakeRequest;
 use crate::protocol::messages::read_response_header;
@@ -81,6 +82,16 @@ pub struct IgniteConnection {
     /// Optional per-request response deadline applied in `send_and_receive`.
     /// `None` disables the timeout (useful in tests).
     request_timeout: Option<Duration>,
+    /// The server node's UUID, learned from the handshake success response
+    /// (protocol ≥ 1.4).  Used by partition-aware routing to key this
+    /// connection's pool by node.  `None` if the server did not advertise it.
+    node_id: Option<Uuid>,
+    /// Latest affinity topology version observed on a response header
+    /// (flag `0x02`).  `major` holds [`i64::MIN`] until the first such header is
+    /// seen.  Shared across clones; used to detect when partition mappings are
+    /// stale.
+    topology_major: Arc<AtomicI64>,
+    topology_minor: Arc<AtomicI32>,
     /// Aborts the background reader task when the last connection clone drops.
     /// Only stored for its `Drop` side effect; never read directly.
     #[allow(dead_code)]
@@ -187,10 +198,11 @@ impl IgniteConnection {
         })??;
 
         let mut hs_bytes = hs_frame.freeze();
-        crate::protocol::handshake::HandshakeResponse::decode(&mut hs_bytes)
+        let hs_resp = crate::protocol::handshake::HandshakeResponse::decode(&mut hs_bytes)
             .map_err(TransportError::Protocol)?;
+        let node_id = hs_resp.node_id;
 
-        debug!("Ignite handshake successful");
+        debug!(?node_id, "Ignite handshake successful");
 
         // ── Shared state ──────────────────────────────────────────────────────
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -263,8 +275,29 @@ impl IgniteConnection {
             pending,
             alive,
             request_timeout,
+            node_id,
+            topology_major: Arc::new(AtomicI64::new(i64::MIN)),
+            topology_minor: Arc::new(AtomicI32::new(0)),
             reader_abort,
         })
+    }
+
+    /// The server node's UUID as learned at handshake (protocol ≥ 1.4), or
+    /// `None` if the server did not advertise it.
+    pub fn node_id(&self) -> Option<Uuid> {
+        self.node_id
+    }
+
+    /// The latest affinity topology version `(major, minor)` observed on a
+    /// response header, or `None` if no topology-bearing response has arrived
+    /// yet.
+    pub fn topology_version(&self) -> Option<(i64, i32)> {
+        let major = self.topology_major.load(Ordering::Acquire);
+        if major == i64::MIN {
+            None
+        } else {
+            Some((major, self.topology_minor.load(Ordering::Acquire)))
+        }
     }
 }
 
@@ -347,7 +380,13 @@ impl IgniteConnection {
     /// transport failure.
     pub async fn request(&self, request_id: i64, payload: Bytes) -> Result<Bytes> {
         let mut response = self.send_and_receive(request_id, payload).await?;
-        let _req_id = read_response_header(&mut response).map_err(TransportError::Protocol)?;
+        let header = read_response_header(&mut response).map_err(TransportError::Protocol)?;
+        if let Some((major, minor)) = header.topology_version {
+            // Monotonically record the newest topology version we have observed
+            // so partition-aware routing can tell when its mappings are stale.
+            self.topology_major.store(major, Ordering::Release);
+            self.topology_minor.store(minor, Ordering::Release);
+        }
         Ok(response)
     }
 

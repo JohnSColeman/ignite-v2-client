@@ -73,7 +73,7 @@ pub mod op_code {
     pub const CACHE_GET_OR_CREATE_WITH_CONFIGURATION: i16 = 1053;
     pub const CACHE_DESTROY: i16 = 1056;
     pub const CACHE_GET_SIZE: i16 = 1020;
-    pub const CACHE_PARTITIONS: i16 = 1100;
+    pub const CACHE_PARTITIONS: i16 = 1101;
     pub const QUERY_SQL: i16 = 2002; // deprecated
     pub const QUERY_SQL_FIELDS: i16 = 2004;
     pub const QUERY_SQL_FIELDS_CURSOR_GET_PAGE: i16 = 2005;
@@ -288,5 +288,12 @@ mod tests {
     #[test]
     fn cache_id_case_insensitive() {
         assert_eq!(cache_id("myCache"), cache_id("MYCACHE"));
+    }
+
+    #[test]
+    fn cache_partitions_opcode_matches_java() {
+        // Java org.apache.ignite.internal.client.thin.ClientOperation
+        // defines CACHE_PARTITIONS(1101).  A wrong opcode is a silent failure.
+        assert_eq!(op_code::CACHE_PARTITIONS, 1101);
     }
 }

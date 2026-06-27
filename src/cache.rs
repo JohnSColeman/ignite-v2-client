@@ -11,21 +11,27 @@ use crate::protocol::messages::{
 use crate::protocol::op_code;
 use crate::transport::{IgniteConnection, next_request_id};
 use bytes::Bytes;
+use uuid::Uuid;
 
+use crate::affinity::AffinityContext;
+use crate::channel::ChannelRegistry;
 use crate::error::{IgniteError, Result};
-use crate::pool::Pool;
 
 // ─── CacheSource ─────────────────────────────────────────────────────────────
 
 /// Backing connection source for an [`IgniteCache`] handle.
 ///
-/// - `Pool` — non-transactional: a connection is checked out from the pool for
-///   each operation and returned immediately.
+/// - `Routed` — non-transactional: each operation routes through the channel
+///   registry, preferring the key's owning node (partition awareness) and
+///   falling back to the default channel.
 /// - `Tx` — transactional: every operation goes through the transaction's
 ///   dedicated connection and embeds the `tx_id` in the cache-header flags byte.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) enum CacheSource {
-    Pool(Pool),
+    Routed {
+        registry: Arc<ChannelRegistry>,
+        affinity: Arc<AffinityContext>,
+    },
     Tx {
         tx_id: i32,
         conn: Arc<IgniteConnection>,
@@ -39,18 +45,40 @@ pub(crate) enum CacheSource {
 ///
 /// Cheap to clone — internally holds an `i32` cache-id and either a pool
 /// reference (Arc-backed) or a transaction connection (Arc-backed).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct IgniteCache {
     pub(crate) cache_id: i32,
     source: CacheSource,
 }
 
+impl std::fmt::Debug for IgniteCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.source {
+            CacheSource::Routed { .. } => "routed",
+            CacheSource::Tx { tx_id, .. } => return f
+                .debug_struct("IgniteCache")
+                .field("cache_id", &self.cache_id)
+                .field("tx_id", tx_id)
+                .finish(),
+        };
+        f.debug_struct("IgniteCache")
+            .field("cache_id", &self.cache_id)
+            .field("source", &kind)
+            .finish()
+    }
+}
+
 impl IgniteCache {
-    /// Create a non-transactional cache handle backed by the connection pool.
-    pub(crate) fn new(cache_id: i32, pool: Pool) -> Self {
+    /// Create a non-transactional cache handle backed by the channel registry,
+    /// routing keys to their owning node via the shared affinity context.
+    pub(crate) fn new(
+        cache_id: i32,
+        registry: Arc<ChannelRegistry>,
+        affinity: Arc<AffinityContext>,
+    ) -> Self {
         Self {
             cache_id,
-            source: CacheSource::Pool(pool),
+            source: CacheSource::Routed { registry, affinity },
         }
     }
 
@@ -68,22 +96,38 @@ impl IgniteCache {
     /// Returns the active transaction ID, or `None` for non-transactional handles.
     fn tx_id(&self) -> Option<i32> {
         match &self.source {
-            CacheSource::Pool(_) => None,
+            CacheSource::Routed { .. } => None,
             CacheSource::Tx { tx_id, .. } => Some(*tx_id),
         }
     }
 
-    /// Obtain a connection (pool checkout or tx connection), send `payload`,
-    /// and return the post-header response bytes.
+    /// Resolve the primary node owning `key`, lazily refreshing the affinity
+    /// mapping first.  Returns `None` (route to the default channel) for
+    /// transactional handles, when PA is disabled, or for unsupported keys.
+    async fn route(&self, key: &IgniteValue) -> Option<Uuid> {
+        match &self.source {
+            CacheSource::Tx { .. } => None,
+            CacheSource::Routed { registry, affinity } => {
+                registry.ensure_affinity(affinity, self.cache_id).await;
+                affinity.affinity_node(self.cache_id, key)
+            }
+        }
+    }
+
+    /// Send `payload` to `target` (its owning node when known, else the default
+    /// channel), returning the post-header response bytes.
     /// `IgniteConnection::request` already strips and validates the response
     /// header, so the returned `Bytes` contains only the operation payload.
-    async fn send(&self, req_id: i64, payload: Bytes) -> Result<Bytes> {
+    async fn send(&self, req_id: i64, payload: Bytes, target: Option<Uuid>) -> Result<Bytes> {
         match &self.source {
-            CacheSource::Pool(pool) => {
-                let conn = pool.get().await?;
-                conn.request(req_id, payload)
+            CacheSource::Routed { registry, .. } => {
+                let conn = registry.get(target).await?;
+                let out = conn
+                    .request(req_id, payload)
                     .await
-                    .map_err(IgniteError::Transport)
+                    .map_err(IgniteError::Transport)?;
+                registry.observe_topology(&conn);
+                Ok(out)
             }
             CacheSource::Tx { conn, .. } => conn
                 .request(req_id, payload)
@@ -97,6 +141,7 @@ impl IgniteCache {
     /// Retrieve a value by key.  Returns `IgniteValue::Null` if the key is not present.
     pub async fn get(&self, key: IgniteValue) -> Result<IgniteValue> {
         let req_id = next_request_id();
+        let target = self.route(&key).await;
         let payload = encode_cache_key_req(
             op_code::CACHE_GET,
             req_id,
@@ -104,7 +149,7 @@ impl IgniteCache {
             &key,
             self.tx_id(),
         );
-        let mut resp = self.send(req_id, payload).await?;
+        let mut resp = self.send(req_id, payload, target).await?;
         decode_cache_value_response(&mut resp).map_err(IgniteError::Protocol)
     }
 
@@ -112,6 +157,7 @@ impl IgniteCache {
     #[must_use = "futures do nothing unless you `.await` them"]
     pub async fn put(&self, key: IgniteValue, value: IgniteValue) -> Result<()> {
         let req_id = next_request_id();
+        let target = self.route(&key).await;
         let payload = encode_cache_kv_req(
             op_code::CACHE_PUT,
             req_id,
@@ -120,7 +166,7 @@ impl IgniteCache {
             &value,
             self.tx_id(),
         );
-        self.send(req_id, payload).await?;
+        self.send(req_id, payload, target).await?;
         Ok(())
     }
 
@@ -128,6 +174,7 @@ impl IgniteCache {
     /// Returns `true` if the value was stored, `false` if the key already existed.
     pub async fn put_if_absent(&self, key: IgniteValue, value: IgniteValue) -> Result<bool> {
         let req_id = next_request_id();
+        let target = self.route(&key).await;
         let payload = encode_cache_kv_req(
             op_code::CACHE_PUT_IF_ABSENT,
             req_id,
@@ -136,7 +183,7 @@ impl IgniteCache {
             &value,
             self.tx_id(),
         );
-        let mut resp = self.send(req_id, payload).await?;
+        let mut resp = self.send(req_id, payload, target).await?;
         read_bool(&mut resp).map_err(IgniteError::Protocol)
     }
 
@@ -151,7 +198,8 @@ impl IgniteCache {
             &keys,
             self.tx_id(),
         );
-        let mut resp = self.send(req_id, payload).await?;
+        // Multi-key requests span partitions; route via the default channel.
+        let mut resp = self.send(req_id, payload, None).await?;
         decode_cache_get_all_response(&mut resp).map_err(IgniteError::Protocol)
     }
 
@@ -166,13 +214,14 @@ impl IgniteCache {
             &entries,
             self.tx_id(),
         );
-        self.send(req_id, payload).await?;
+        self.send(req_id, payload, None).await?;
         Ok(())
     }
 
     /// Returns `true` if the cache contains the given key.
     pub async fn contains_key(&self, key: IgniteValue) -> Result<bool> {
         let req_id = next_request_id();
+        let target = self.route(&key).await;
         let payload = encode_cache_key_req(
             op_code::CACHE_CONTAINS_KEY,
             req_id,
@@ -180,7 +229,7 @@ impl IgniteCache {
             &key,
             self.tx_id(),
         );
-        let mut resp = self.send(req_id, payload).await?;
+        let mut resp = self.send(req_id, payload, target).await?;
         read_bool(&mut resp).map_err(IgniteError::Protocol)
     }
 
@@ -200,6 +249,7 @@ impl IgniteCache {
     /// Returns `true` if the value was replaced, `false` if the key was absent.
     pub async fn replace(&self, key: IgniteValue, value: IgniteValue) -> Result<bool> {
         let req_id = next_request_id();
+        let target = self.route(&key).await;
         let payload = encode_cache_kv_req(
             op_code::CACHE_REPLACE,
             req_id,
@@ -208,7 +258,7 @@ impl IgniteCache {
             &value,
             self.tx_id(),
         );
-        let mut resp = self.send(req_id, payload).await?;
+        let mut resp = self.send(req_id, payload, target).await?;
         read_bool(&mut resp).map_err(IgniteError::Protocol)
     }
 
@@ -216,6 +266,7 @@ impl IgniteCache {
     /// Returns `IgniteValue::Null` if the key was not previously present.
     pub async fn get_and_put(&self, key: IgniteValue, value: IgniteValue) -> Result<IgniteValue> {
         let req_id = next_request_id();
+        let target = self.route(&key).await;
         let payload = encode_cache_kv_req(
             op_code::CACHE_GET_AND_PUT,
             req_id,
@@ -224,7 +275,7 @@ impl IgniteCache {
             &value,
             self.tx_id(),
         );
-        let mut resp = self.send(req_id, payload).await?;
+        let mut resp = self.send(req_id, payload, target).await?;
         decode_cache_value_response(&mut resp).map_err(IgniteError::Protocol)
     }
 
@@ -232,6 +283,7 @@ impl IgniteCache {
     /// Returns `IgniteValue::Null` if the key was not present.
     pub async fn get_and_remove(&self, key: IgniteValue) -> Result<IgniteValue> {
         let req_id = next_request_id();
+        let target = self.route(&key).await;
         let payload = encode_cache_key_req(
             op_code::CACHE_GET_AND_REMOVE,
             req_id,
@@ -239,7 +291,7 @@ impl IgniteCache {
             &key,
             self.tx_id(),
         );
-        let mut resp = self.send(req_id, payload).await?;
+        let mut resp = self.send(req_id, payload, target).await?;
         decode_cache_value_response(&mut resp).map_err(IgniteError::Protocol)
     }
 
@@ -251,6 +303,7 @@ impl IgniteCache {
         value: IgniteValue,
     ) -> Result<IgniteValue> {
         let req_id = next_request_id();
+        let target = self.route(&key).await;
         let payload = encode_cache_kv_req(
             op_code::CACHE_GET_AND_REPLACE,
             req_id,
@@ -259,7 +312,7 @@ impl IgniteCache {
             &value,
             self.tx_id(),
         );
-        let mut resp = self.send(req_id, payload).await?;
+        let mut resp = self.send(req_id, payload, target).await?;
         decode_cache_value_response(&mut resp).map_err(IgniteError::Protocol)
     }
 
@@ -281,7 +334,7 @@ impl IgniteCache {
         let req_id = next_request_id();
         let payload =
             encode_cache_get_size(op_code::CACHE_GET_SIZE, req_id, self.cache_id, self.tx_id());
-        let mut resp = self.send(req_id, payload).await?;
+        let mut resp = self.send(req_id, payload, None).await?;
         decode_cache_get_size_response(&mut resp).map_err(IgniteError::Protocol)
     }
 }
@@ -290,29 +343,33 @@ impl IgniteCache {
 
 /// Send `CACHE_GET_OR_CREATE_WITH_NAME` and return an `IgniteCache` handle.
 /// `IgniteConnection::request` strips the response header automatically.
-pub(crate) async fn get_or_create_cache_by_name(name: &str, pool: &Pool) -> Result<IgniteCache> {
+pub(crate) async fn get_or_create_cache_by_name(
+    name: &str,
+    registry: &Arc<ChannelRegistry>,
+    affinity: &Arc<AffinityContext>,
+) -> Result<IgniteCache> {
     let req_id = next_request_id();
     let payload =
         encode_cache_create_with_name(op_code::CACHE_GET_OR_CREATE_WITH_NAME, req_id, name);
 
-    let conn = pool.get().await?;
+    let conn = registry.get(None).await?;
     // request() strips the response header; for this op the remaining body is empty.
     conn.request(req_id, payload)
         .await
         .map_err(IgniteError::Transport)?;
 
     let cid = crate::protocol::cache_id(name);
-    Ok(IgniteCache::new(cid, pool.clone()))
+    Ok(IgniteCache::new(cid, registry.clone(), affinity.clone()))
 }
 
 /// Send `CACHE_DESTROY` for the given cache name.
 /// `IgniteConnection::request` strips the response header automatically.
-pub(crate) async fn destroy_cache_by_name(name: &str, pool: &Pool) -> Result<()> {
+pub(crate) async fn destroy_cache_by_name(name: &str, registry: &ChannelRegistry) -> Result<()> {
     let cid = crate::protocol::cache_id(name);
     let req_id = next_request_id();
     let payload = encode_cache_destroy_req(op_code::CACHE_DESTROY, req_id, cid);
 
-    let conn = pool.get().await?;
+    let conn = registry.get(None).await?;
     // request() strips the response header; for this op the remaining body is empty.
     conn.request(req_id, payload)
         .await

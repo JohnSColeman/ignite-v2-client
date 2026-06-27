@@ -1,7 +1,9 @@
 pub(crate) mod protocol;
 pub(crate) mod transport;
 
+pub mod affinity;
 pub mod cache;
+pub(crate) mod channel;
 pub mod client;
 pub mod error;
 pub mod pool;

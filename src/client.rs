@@ -8,26 +8,38 @@ use crate::protocol::messages::{
 use crate::protocol::{IgniteValue, StatementType, TxConcurrency, TxIsolation, cache_id, op_code};
 use crate::transport::{IgniteConnection, next_request_id};
 
+use crate::affinity::AffinityContext;
 use crate::cache::{IgniteCache, destroy_cache_by_name, get_or_create_cache_by_name};
+use crate::channel::ChannelRegistry;
 use crate::error::{IgniteError, Result};
-use crate::pool::{self, IgniteClientConfig, Pool};
+use crate::pool::IgniteClientConfig;
 use crate::query::{QueryResult, UpdateResult};
 use crate::stream::{self, QueryStream};
 use crate::transaction::{Transaction, execute_sql_fields, extract_rows_affected};
 
-/// The main Ignite client.  Wraps a connection pool; cheap to clone.
+/// The main Ignite client.  Wraps a per-node connection registry with optional
+/// partition-aware routing; cheap to clone.
 #[derive(Clone)]
 pub struct IgniteClient {
-    pool: Pool,
+    registry: Arc<ChannelRegistry>,
+    affinity: Arc<AffinityContext>,
     config: Arc<IgniteClientConfig>,
 }
 
 impl IgniteClient {
-    /// Create a new client.  Opens the pool (no connections are made yet).
+    /// Create a new client.  Opens one pool per configured node address (no
+    /// connections are made yet).  Partition awareness defaults to on when ≥ 2
+    /// nodes are configured, unless explicitly overridden in the config.
     pub fn new(config: IgniteClientConfig) -> Self {
         let config = Arc::new(config);
+        let registry = Arc::new(ChannelRegistry::new(&config));
+        let enabled = config
+            .partition_awareness
+            .unwrap_or(registry.node_count() >= 2);
+        let affinity = Arc::new(AffinityContext::new(enabled));
         Self {
-            pool: pool::build_pool((*config).clone()),
+            registry,
+            affinity,
             config,
         }
     }
@@ -49,7 +61,7 @@ impl IgniteClient {
     /// # }
     /// ```
     pub async fn query(&self, sql: &str, params: Vec<IgniteValue>) -> Result<QueryResult> {
-        let conn_obj = self.pool.get().await?;
+        let conn_obj = self.registry.get(None).await?;
         let mut req = SqlFieldsRequest::new(sql, params);
         req.page_size = self.config.page_size as i32;
         execute_sql_fields(&conn_obj, req).await
@@ -68,7 +80,7 @@ impl IgniteClient {
         use crate::protocol::messages::SqlFieldsFirstPage;
         use crate::protocol::op_code;
 
-        let conn_obj = self.pool.get().await?;
+        let conn_obj = self.registry.get(None).await?;
         // Shallow-clone shares the underlying TCP connection; the pool Object
         // can be returned immediately (the slot becomes available again).
         let conn = Arc::new(conn_obj.clone());
@@ -93,7 +105,7 @@ impl IgniteClient {
     /// Execute a DML statement (INSERT/UPDATE/DELETE).
     #[must_use = "futures do nothing unless you `.await` them"]
     pub async fn execute(&self, sql: &str, params: Vec<IgniteValue>) -> Result<UpdateResult> {
-        let conn_obj = self.pool.get().await?;
+        let conn_obj = self.registry.get(None).await?;
         let req = SqlFieldsRequest {
             statement_type: StatementType::Update,
             ..SqlFieldsRequest::new(sql, params)
@@ -184,7 +196,7 @@ impl IgniteClient {
 
     /// Pool status for observability.
     pub fn pool_status(&self) -> deadpool::managed::Status {
-        self.pool.status()
+        self.registry.primary_status()
     }
 
     // ── KV cache API ──────────────────────────────────────────────────────────
@@ -192,13 +204,13 @@ impl IgniteClient {
     /// Return a [`IgniteCache`] handle for a cache that is assumed to already
     /// exist.  This is a pure in-process operation (no network round-trip).
     pub fn cache(&self, name: &str) -> IgniteCache {
-        IgniteCache::new(cache_id(name), self.pool.clone())
+        IgniteCache::new(cache_id(name), self.registry.clone(), self.affinity.clone())
     }
 
     /// Create the named cache if it does not already exist, then return a
     /// handle to it.  Equivalent to `CACHE_GET_OR_CREATE_WITH_NAME`.
     pub async fn get_or_create_cache(&self, name: &str) -> Result<IgniteCache> {
-        get_or_create_cache_by_name(name, &self.pool).await
+        get_or_create_cache_by_name(name, &self.registry, &self.affinity).await
     }
 
     /// Create the named cache with **TRANSACTIONAL** atomicity if it does not already exist,
@@ -214,24 +226,28 @@ impl IgniteClient {
             name,
             true, // transactional = true
         );
-        let conn = self.pool.get().await?;
+        let conn = self.registry.get(None).await?;
         conn.request(req_id, payload)
             .await
             .map_err(IgniteError::Transport)?;
         // Response body is void — success means the cache exists with TRANSACTIONAL atomicity.
-        Ok(IgniteCache::new(cache_id(name), self.pool.clone()))
+        Ok(IgniteCache::new(
+            cache_id(name),
+            self.registry.clone(),
+            self.affinity.clone(),
+        ))
     }
 
     /// Destroy the named cache.  All data is permanently lost.
     pub async fn destroy_cache(&self, name: &str) -> Result<()> {
-        destroy_cache_by_name(name, &self.pool).await
+        destroy_cache_by_name(name, &self.registry).await
     }
 
     /// Return the names of all caches currently defined on the server.
     pub async fn cache_names(&self) -> Result<Vec<String>> {
         let req_id = next_request_id();
         let payload = encode_cache_get_names(op_code::CACHE_GET_NAMES, req_id);
-        let conn = self.pool.get().await?;
+        let conn = self.registry.get(None).await?;
         let mut resp = conn
             .request(req_id, payload)
             .await

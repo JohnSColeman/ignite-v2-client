@@ -4,6 +4,13 @@ An async Rust thin client for **Apache Ignite 2.x**, implementing the
 [Ignite Binary Client Protocol](https://ignite.apache.org/docs/latest/thin-clients/getting-started-with-thin-clients)
 over TCP.
 
+> **New in 0.3.0 — Partition awareness / affinity routing.** The client now
+> connects to every configured cluster node, computes each key's primary node
+> locally, and sends cache operations straight to it — eliminating the
+> server-side proxy hop. It is a pure optimization with a fail-safe fallback to
+> the default channel, so results never change. See
+> [Partition awareness](#partition-awareness).
+
 ---
 
 ## Table of Contents
@@ -35,9 +42,11 @@ over TCP.
   - [Connection pool](#connection-pool)
   - [Transaction connections](#transaction-connections)
   - [Pagination](#pagination)
+  - [Partition awareness](#partition-awareness)
 - [Codec Details](#codec-details)
 - [Comparison with Existing Rust Clients](#comparison-with-existing-rust-clients)
 - [Running Tests](#running-tests)
+  - [Local 3-node test cluster](#local-3-node-test-cluster)
 - [License](#license)
 
 ---
@@ -61,7 +70,10 @@ over TCP.
 | Streaming `QueryStream` cursor | ✅ |
 | TCP keepalive | ✅ |
 | Client-side request timeouts | ✅ |
-| Partition awareness / affinity routing | 🔲 Future |
+| Multi-node connection registry (one pool per node, keyed by node UUID) | ✅ |
+| Partition awareness / affinity routing (primary-node routing for KV ops) | ✅ |
+| Server endpoint discovery (auto-learn nodes not in the address list) | 🔲 Future |
+| Backup-node routing for read-only ops | 🔲 Future |
 
 ---
 
@@ -102,7 +114,11 @@ ignite-client/
 │   ├── lib.rs              ← public re-exports
 │   ├── client.rs           ← IgniteClient: query, execute, begin_transaction, cache, …
 │   ├── transaction.rs      ← Transaction: query, execute, commit, rollback, cache, drop
-│   ├── cache.rs            ← IgniteCache: get, put, get_all, put_all, remove, …
+│   ├── cache.rs            ← IgniteCache: get, put, get_all, put_all, remove, … (affinity-routed)
+│   ├── affinity.rs         ← partition awareness: key hashing, rendezvous partition/mask,
+│   │                          CACHE_PARTITIONS codec, AffinityContext (mappings + refresh)
+│   ├── channel.rs          ← ChannelRegistry: one pool per node, node-UUID→pool routing,
+│   │                          round-robin fallback, lazy mapping refresh
 │   ├── stream.rs           ← QueryStream: lazily-paged streaming cursor
 │   ├── query.rs            ← QueryResult, Row, Column, ColumnType, UpdateResult
 │   ├── pool.rs             ← IgniteClientConfig, deadpool manager
@@ -110,25 +126,32 @@ ignite-client/
 │   ├── protocol/           ← pure codec layer: no I/O, no async
 │   │   ├── mod.rs
 │   │   ├── types.rs        ← IgniteValue enum + column_type(), ColumnType, op/type codes
-│   │   ├── codec.rs        ← encode_value / decode_value roundtrip
-│   │   ├── handshake.rs    ← protocol 1.7.0 handshake encoding
+│   │   ├── codec.rs        ← encode_value / decode_value roundtrip, UUID/byte-array readers
+│   │   ├── handshake.rs    ← protocol 1.7.0 handshake encoding + server node-UUID parsing
 │   │   ├── error.rs        ← ProtocolError
-│   │   └── messages.rs     ← SqlFieldsRequest, TxStart/End, cache ops, cursor pagination
+│   │   └── messages.rs     ← SqlFieldsRequest, TxStart/End, cache ops, response header (topology version)
 │   └── transport/          ← async TCP layer
 │       ├── mod.rs
-│       ├── connection.rs   ← IgniteConnection (pipelined, multiplexed)
+│       ├── connection.rs   ← IgniteConnection (pipelined, multiplexed; node UUID, topology version)
 │       ├── error.rs        ← TransportError
 │       └── tls.rs          ← build_tls_config (rustls + native-certs)
-└── tests/
-    ├── smoke.rs            ← 39 broad end-to-end integration tests
-    ├── metadata.rs         ← 12 schema/system-view metadata tests
-    ├── functional_query.rs ←  6 SQL query behaviour tests (pagination, mixed KV+SQL, errors)
-    ├── functional_cache.rs ←  5 KV cache API lifecycle and operation tests
-    └── transaction.rs      ←  3 concurrent transaction correctness tests
+├── tests/
+│   ├── smoke.rs            ← 35 broad end-to-end integration tests
+│   ├── metadata.rs         ← 10 schema/system-view metadata tests
+│   ├── functional_query.rs ←  6 SQL query behaviour tests (pagination, mixed KV+SQL, errors)
+│   ├── functional_cache.rs ←  5 KV cache API lifecycle and operation tests
+│   ├── transaction.rs      ←  3 concurrent transaction correctness tests
+│   └── partition_awareness.rs ← 2 affinity-routing tests (roundtrip + PA-on/off parity)
+├── local-cluster/          ← scripts + config for a local 3-node test cluster
+│   ├── ignite-config.xml   ← static-discovery node config (partitioned cache, thin connector)
+│   ├── start.sh            ← launch 3 nodes on ports 10800/10801/10802
+│   └── stop.sh             ← stop the local nodes
+└── docs/
+    └── partition-awareness-plan.md  ← design/port plan for the affinity feature
 ```
 
-The `protocol` module has no I/O dependency, so its codec tests run without a
-live Ignite node.
+The `protocol` and `affinity` modules have no I/O dependency, so their codec and
+routing-logic tests run without a live Ignite node.
 
 ---
 
@@ -315,10 +338,12 @@ let config = IgniteClientConfig::new("localhost:10800")
 
 ```rust,ignore
 pub struct IgniteClientConfig {
-    pub address: String,                  // "host:port"
+    pub address: String,                  // primary "host:port" (first of `addresses`)
+    pub addresses: Vec<String>,           // all cluster node addresses (for routing)
+    pub partition_awareness: Option<bool>,// None = auto (on when ≥ 2 addresses); Some(b) forces it
     pub username: Option<String>,
     pub password: Option<String>,
-    pub max_pool_size: usize,             // default: 10
+    pub max_pool_size: usize,             // default: 10 (per node)
     pub connect_timeout: Duration,        // default: 10 s
     pub request_timeout: Duration,        // default: 30 s
     pub page_size: usize,                 // SQL rows per round-trip, default: 1024
@@ -327,7 +352,9 @@ pub struct IgniteClientConfig {
 }
 
 impl IgniteClientConfig {
-    pub fn new(address: impl Into<String>) -> Self;
+    pub fn new(address: impl Into<String>) -> Self;       // single-node convenience
+    pub fn with_addresses(self, addresses: Vec<String>) -> Self;   // multi-node cluster
+    pub fn with_partition_awareness(self, enabled: bool) -> Self;  // force PA on/off
     pub fn with_auth(self, username, password) -> Self;
     pub fn with_pool_size(self, size: usize) -> Self;
     pub fn with_connect_timeout(self, duration: Duration) -> Self;
@@ -340,11 +367,17 @@ impl IgniteClientConfig {
 
 `connect_timeout` is also used as the deadpool `wait` and `create` timeout.
 `request_timeout` is applied per-request inside `send_and_receive`.
+`new()` seeds `addresses` with the single address; `with_addresses()` replaces
+the list and sets `address` to the first entry. Partition awareness is enabled
+automatically once two or more addresses are configured (see
+[Partition awareness](#partition-awareness)).
 
 ### IgniteClient
 
 `IgniteClient` is `Clone` — share a single instance across tasks; it wraps an
-internal `Arc`'d pool.
+`Arc`'d per-node channel registry and a shared affinity context. Cache
+operations are automatically routed to the key's owning node when partition
+awareness is enabled.
 
 ```rust,ignore
 impl IgniteClient {
@@ -432,8 +465,12 @@ Transaction concurrency modes:
 ### IgniteCache
 
 Obtained via `client.cache()`, `client.get_or_create_cache()`, or
-`transaction.cache()`.  Cheap to clone — holds an `i32` cache ID and either a
-pool reference or a transaction connection.
+`transaction.cache()`.  Cheap to clone — holds an `i32` cache ID and either the
+channel registry + affinity context (non-transactional, affinity-routed) or a
+transaction connection.
+
+> **Cache names are case-insensitive** — `cache_id()` upper-cases the name
+> before hashing. Use a consistent case (the test suite uses upper-case names).
 
 ```rust,ignore
 impl IgniteCache {
@@ -639,6 +676,74 @@ flag.
 The `page_size` config field controls how many rows are returned per server
 round-trip (default 1024).
 
+### Partition awareness
+
+Without partition awareness every request goes to one configured node, and the
+server silently re-routes each key to its owning node — an extra network hop.
+With partition awareness the client computes the owning node locally and sends
+the request straight to it. The design mirrors the Java thin client
+(`org.apache.ignite.internal.client.thin`):
+
+```
+        ┌──────────────── IgniteClient ────────────────┐
+        │  AffinityContext (Arc-shared)                 │
+        │   • partition → primary-node UUID mappings    │
+        │   • topology version + single-flight refresh  │
+        └───────────────────────────────────────────────┘
+                          │ affinity_node(cache_id, key)
+                          ▼
+   key ─▶ affinity_hash(key) ─▶ partition(hash, mask, parts) ─▶ node UUID
+                          │
+                          ▼
+        ┌──────────── ChannelRegistry ─────────────┐
+        │  pool[node-1]  pool[node-2]  pool[node-3] │  ← one deadpool pool per node
+        │  node UUID → pool index (learned)         │
+        └───────────────────────────────────────────┘
+                          │ get(target) → owning node, else default round-robin
+                          ▼
+                  request sent to the primary node
+```
+
+How it works:
+
+1. **Handshake** — connecting to each node learns its **node UUID** (parsed from
+   the protocol 1.7 handshake success response) and keys that node's pool.
+2. **Mapping fetch** — on first use of a cache, or after a topology change, the
+   client issues `CACHE_PARTITIONS` (op 1101) and decodes the
+   `partition → node` table. Fetches are single-flighted per cache.
+3. **Routing** — for a single-key op, `affinity_hash(key)` (a faithful port of
+   the JVM `hashCode()` for primitives / `String` / `UUID`) feeds the rendezvous
+   `partition(...)` function; the resulting partition selects the primary node's
+   pool.
+4. **Topology tracking** — every response header carries the affinity topology
+   version; a bump marks the held mappings stale and triggers a lazy refresh.
+
+**Fail safe.** Partition awareness is a pure optimization. Any miss — PA
+disabled, no mapping yet, unknown/unsupported key type, unknown node, or a dead
+target pool — falls back to the default channel, so observable results are
+always identical to the single-node path. Multi-key ops (`get_all`, `put_all`),
+SQL, and transactions use the default channel.
+
+**Enablement.** Auto-on when two or more addresses are configured; override with
+`with_partition_awareness(true|false)`. Configure the cluster with:
+
+```rust,ignore
+let config = IgniteClientConfig::new("node1:10800")
+    .with_addresses(vec![
+        "node1:10800".into(),
+        "node2:10800".into(),
+        "node3:10800".into(),
+    ]);
+let client = IgniteClient::new(config);
+
+let cache = client.get_or_create_cache("MY_CACHE").await?;
+cache.put(IgniteValue::Int(42), IgniteValue::Long(7)).await?; // routed to key 42's node
+```
+
+Scope: routing currently covers primitive, `String`, and `UUID` keys (the types
+with well-defined, exactly-replicable Java hash codes). Custom affinity-key
+fields, backup-node routing, and server endpoint discovery are future work.
+
 ---
 
 ## Codec Details
@@ -684,11 +789,12 @@ pub fn java_hash(s: &str) -> i32 {
 }
 ```
 
-The `cache_id()` helper derives the cache ID from a cache name:
+The `cache_id()` helper derives the cache ID from a cache name. The name is
+upper-cased first, so cache names are effectively case-insensitive:
 
 ```rust
 pub fn cache_id(cache_name: &str) -> i32 {
-    java_hash(cache_name)
+    java_hash(&cache_name.to_uppercase())
 }
 ```
 
@@ -709,6 +815,7 @@ pub fn cache_id(cache_name: &str) -> i32 {
 | Query parameters | ✗ | ✗ | ✅ |
 | TLS | ✗ | ✗ | ✅ |
 | KV get/put | ✅ | ✅ | ✅ |
+| Partition awareness / affinity routing | ✗ | ✗ | ✅ |
 | Last commit | 2020 | 2020 | 2026 |
 | Intended use | learning exercise | abandoned fork | production |
 
@@ -735,21 +842,47 @@ Covers:
 - `java_hash()` against known Java reference values
 - `SqlFieldsRequest` encode/decode
 - Transaction start/end encoding
+- **Partition awareness** (`src/affinity.rs`, `src/channel.rs`):
+  - `affinity_hash()` JVM `hashCode` golden vectors per key type (Int, Long,
+    Bool, Byte/Short/Char, String, UUID) and unsupported-kind fallback
+  - rendezvous `partition()` / `calculate_mask()` / `safe_abs()` golden vectors
+  - `CACHE_PARTITIONS` request encoder + response decoder (against byte fixtures)
+  - `AffinityContext` routing decisions, topology-version ordering, single-flight
+    refresh; `PoolSelector` node→pool mapping and round-robin fallback
+  - `CACHE_PARTITIONS` opcode (1101), node-UUID and feature-bitmask handshake
+    parsing, and response-header topology-version capture
 
 ### Integration tests (require a live Ignite 2.x node on localhost:10800)
 
 All integration test modules connect to `localhost:10800` with no
-authentication.  Start Ignite before running them.
+authentication.  Start Ignite before running them — the easiest way is the
+bundled [local 3-node cluster](#local-3-node-test-cluster).
 
 DML-inside-transaction tests (used by `smoke.rs` and `transaction.rs`) require
-the JVM system property that enables DML in thin-client transactions:
+the JVM system property that enables DML in thin-client transactions, and the
+SQL `DATE` temporal test expects a UTC server timezone:
 
 ```bash
 # Linux / macOS
-IGNITE_HOME/bin/ignite.sh -DIGNITE_ALLOW_DML_INSIDE_TRANSACTION=true config.xml
+IGNITE_HOME/bin/ignite.sh \
+    -DIGNITE_ALLOW_DML_INSIDE_TRANSACTION=true \
+    -Duser.timezone=UTC \
+    config.xml
 
 # Windows (example wrapper script)
 C:\ignite\run-ignite.bat
+```
+
+(The `local-cluster/start.sh` script sets both of these automatically.)
+
+The `partition_awareness.rs` module exercises affinity routing. Point it at the
+whole cluster with the `IGNITE_ADDRS` environment variable (comma-separated);
+without it the tests use the single default address and still exercise the full
+routing pipeline against one node:
+
+```bash
+IGNITE_ADDRS=localhost:10800,localhost:10801,localhost:10802 \
+  cargo test --test partition_awareness -- --nocapture --test-threads=1
 ```
 
 **Always run integration tests with `--test-threads=1`.**  Parallel DDL
@@ -766,11 +899,12 @@ cargo test --tests -- --nocapture --test-threads=1
 Or run individual modules:
 
 ```bash
-cargo test --test smoke          -- --nocapture --test-threads=1
-cargo test --test metadata       -- --nocapture --test-threads=1
-cargo test --test functional_query -- --nocapture --test-threads=1
-cargo test --test functional_cache -- --nocapture --test-threads=1
-cargo test --test transaction    -- --nocapture --test-threads=1
+cargo test --test smoke              -- --nocapture --test-threads=1
+cargo test --test metadata           -- --nocapture --test-threads=1
+cargo test --test functional_query   -- --nocapture --test-threads=1
+cargo test --test functional_cache   -- --nocapture --test-threads=1
+cargo test --test transaction        -- --nocapture --test-threads=1
+cargo test --test partition_awareness -- --nocapture --test-threads=1
 ```
 
 > **Windows note:** If Windows Smart App Control blocks newly compiled test
@@ -782,7 +916,7 @@ cargo test --test transaction    -- --nocapture --test-threads=1
 
 ---
 
-### `tests/smoke.rs` — 39 tests
+### `tests/smoke.rs` — 35 tests
 
 Broad end-to-end coverage of every public API surface.  Tests are prefixed
 `smoke_`.
@@ -872,6 +1006,56 @@ Rust port of selected tests from Apache Ignite's `BlockingTxOpsTest.java`.
 | `tx_sum_invariant` | `testTransactionalConsistency` (Pessimistic/RepeatableRead) | 5 concurrent tasks × 100 key-transfer iterations; sum of all values remains 0 |
 | `tx_sum_invariant_optimistic` | `testTransactionalConsistency` (Optimistic/Serializable) | Same invariant with conflict-retry loop |
 | `tx_all_cache_ops_inside_tx` | `testBlockingOps` | Every cache operation works correctly inside an explicit transaction: `put`, `get`, `contains_key`, `put_all`, `get_all`, `put_if_absent`, `replace`, `get_and_put`, `get_and_remove`, `get_and_replace`, `remove`, `remove_all` |
+
+---
+
+### `tests/partition_awareness.rs` — 2 tests
+
+End-to-end affinity-routing tests. Set `IGNITE_ADDRS` to route across multiple
+nodes; otherwise they run against the single default address.
+
+| Test | What it verifies |
+|---|---|
+| `pa_put_get_roundtrip_is_correct` | A spread of keys `put`/`get` correctly with partition awareness on — the routed write/read path returns every stored value |
+| `pa_on_and_off_agree` | Reading the same keys through a PA-on and a PA-off client yields identical results (the fail-safe guarantee: routing never changes observable results) |
+
+Enable `RUST_LOG=ignite_client=debug` to see routing decisions, e.g.
+`fetched cache partitions cache_id=… version=… mappings=… applicable=…`.
+
+---
+
+### Local 3-node test cluster
+
+The `local-cluster/` directory contains everything needed to run a partitioned
+3-node Apache Ignite cluster on localhost from a local Ignite binary:
+
+| File | Purpose |
+|---|---|
+| `ignite-config.xml` | Node config: static localhost discovery, a partitioned cache, thin-client connector |
+| `start.sh` | Launch three nodes sequentially on thin ports 10800 / 10801 / 10802 |
+| `stop.sh` | Stop the local nodes |
+
+Usage:
+
+```bash
+# point IGNITE_HOME at your local Apache Ignite install (contains bin/ignite.sh)
+export IGNITE_HOME=/path/to/apache-ignite-x.y.z-bin
+
+./local-cluster/start.sh          # forms a 3-node cluster, waits until ready
+./local-cluster/stop.sh           # tears it down
+```
+
+`start.sh` auto-selects Java 11 (via `/usr/libexec/java_home -v 11` on macOS) and
+sets `-DIGNITE_ALLOW_DML_INSIDE_TRANSACTION=true` and `-Duser.timezone=UTC` so the
+full integration suite — including the transaction and temporal tests — passes.
+Logs are written to `/tmp/ignite-node{1,2,3}.log`.
+
+Run the complete suite against it:
+
+```bash
+export IGNITE_ADDRS=localhost:10800,localhost:10801,localhost:10802
+cargo test --tests -- --test-threads=1
+```
 
 ---
 

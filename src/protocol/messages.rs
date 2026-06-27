@@ -37,8 +37,18 @@ pub fn write_request_header(buf: &mut BytesMut, op_code: i16, request_id: i64) {
 
 // ─── Response header ──────────────────────────────────────────────────────────
 
+/// Parsed response header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseHeader {
+    pub request_id: i64,
+    /// `Some((major, minor))` when the response carried an affinity topology
+    /// version (header flag `0x02`), i.e. the topology changed.  This is the
+    /// trigger to refresh partition-awareness mappings.
+    pub topology_version: Option<(i64, i32)>,
+}
+
 /// Read and validate the response header from a response payload buffer.
-/// Returns `Ok(request_id)` on success or `Err(ServerError)` on error.
+/// Returns `Ok(ResponseHeader)` on success or `Err(ServerError)` on error.
 ///
 /// Ignite 2.17 / protocol 1.7 response format:
 ///   request_id: i64
@@ -46,14 +56,17 @@ pub fn write_request_header(buf: &mut BytesMut, op_code: i16, request_id: i64) {
 ///     flags & 0x02 → affinity topology version present: i64 major + i32 minor (12 bytes)
 ///     flags & 0x01 → error indicator: status i32 follows (always non-zero), then error message
 ///   if flags & 0x01 is NOT set → success, response body follows immediately
-pub fn read_response_header(buf: &mut Bytes) -> Result<i64> {
+pub fn read_response_header(buf: &mut Bytes) -> Result<ResponseHeader> {
     let request_id = read_i64_le(buf)?;
 
     let flags = read_i16_le(buf)?;
-    if flags & FLAG_TOPOLOGY != 0 {
-        let _ = read_i64_le(buf)?; // affinity topology version major — discard
-        let _ = read_i32_le(buf)?; // affinity topology version minor — discard
-    }
+    let topology_version = if flags & FLAG_TOPOLOGY != 0 {
+        let major = read_i64_le(buf)?; // affinity topology version major
+        let minor = read_i32_le(buf)?; // affinity topology version minor
+        Some((major, minor))
+    } else {
+        None
+    };
     if flags & FLAG_ERROR != 0 {
         // Error response: read status code and message
         let status = read_i32_le(buf)?;
@@ -63,7 +76,10 @@ pub fn read_response_header(buf: &mut Bytes) -> Result<i64> {
             message: msg,
         });
     }
-    Ok(request_id)
+    Ok(ResponseHeader {
+        request_id,
+        topology_version,
+    })
 }
 
 /// Read an error message encoded as a typed binary object.
@@ -514,6 +530,45 @@ mod tests {
         let bytes = req.encode(2004, 1);
         // Should at minimum have: i16 opcode + i64 req_id + i32 cache_id + ...
         assert!(bytes.len() > 14);
+    }
+
+    #[test]
+    fn response_header_no_flags() {
+        let mut buf = BytesMut::new();
+        buf.put_i64_le(77); // request id
+        buf.put_i16_le(0); // no flags
+        let mut bytes = buf.freeze();
+        let h = read_response_header(&mut bytes).unwrap();
+        assert_eq!(h.request_id, 77);
+        assert_eq!(h.topology_version, None);
+    }
+
+    #[test]
+    fn response_header_captures_topology_version() {
+        let mut buf = BytesMut::new();
+        buf.put_i64_le(5); // request id
+        buf.put_i16_le(0x02); // FLAG_TOPOLOGY
+        buf.put_i64_le(42); // topology major
+        buf.put_i32_le(3); // topology minor
+        let mut bytes = buf.freeze();
+        let h = read_response_header(&mut bytes).unwrap();
+        assert_eq!(h.request_id, 5);
+        assert_eq!(h.topology_version, Some((42, 3)));
+    }
+
+    #[test]
+    fn response_header_topology_then_error() {
+        // Both flags set: topology bytes are consumed first, then the error.
+        let mut buf = BytesMut::new();
+        buf.put_i64_le(9);
+        buf.put_i16_le(0x02 | 0x01); // topology + error
+        buf.put_i64_le(1); // major
+        buf.put_i32_le(0); // minor
+        buf.put_i32_le(10000); // status
+        buf.put_u8(super::super::types::type_code::NULL); // null error message
+        let mut bytes = buf.freeze();
+        let err = read_response_header(&mut bytes).unwrap_err();
+        assert!(matches!(err, ProtocolError::ServerError { status: 10000, .. }));
     }
 
     #[test]

@@ -81,6 +81,49 @@ pub fn read_bool(buf: &mut Bytes) -> Result<bool> {
     Ok(buf.get_u8() != 0)
 }
 
+/// Reads an Ignite binary-protocol UUID *object*: a 1-byte type-code flag
+/// (`10` = UUID, `101` = NULL) followed — for the non-null case — by two
+/// little-endian `i64` halves `(mostSignificantBits, leastSignificantBits)`.
+///
+/// Matches Java `BinaryReaderEx.readUuid()` →
+/// `new UUID(in.readLong(), in.readLong())`, which is how the thin-client
+/// handshake and the `CACHE_PARTITIONS` response encode node UUIDs.  This is
+/// **distinct** from the 16-byte big-endian form used for a typed UUID *value*
+/// in [`decode_value`]; the two are never interchanged.
+pub fn read_uuid_obj(buf: &mut Bytes) -> Result<Option<Uuid>> {
+    let flag = read_u8(buf)?;
+    match flag {
+        type_code::NULL => Ok(None),
+        type_code::UUID => {
+            let msb = read_i64_le(buf)? as u64;
+            let lsb = read_i64_le(buf)? as u64;
+            Ok(Some(Uuid::from_u64_pair(msb, lsb)))
+        }
+        other => Err(ProtocolError::UnknownTypeCode(other)),
+    }
+}
+
+/// Reads an Ignite binary-protocol byte-array *object*: a 1-byte type-code flag
+/// (`12` = BYTE_ARRAY, `101` = NULL) then, for the non-null case, an `i32` LE
+/// length followed by that many raw bytes.  A NULL flag yields an empty `Vec`.
+/// Matches Java `BinaryReaderEx.readByteArray()`.
+pub fn read_byte_array_obj(buf: &mut Bytes) -> Result<Vec<u8>> {
+    let flag = read_u8(buf)?;
+    match flag {
+        type_code::NULL => Ok(Vec::new()),
+        type_code::BYTE_ARRAY => {
+            let len = read_i32_le(buf)?;
+            if len <= 0 {
+                return Ok(Vec::new());
+            }
+            let len = len as usize;
+            require(buf, len)?;
+            Ok(buf.copy_to_bytes(len).to_vec())
+        }
+        other => Err(ProtocolError::UnknownTypeCode(other)),
+    }
+}
+
 // ─── Write helpers ────────────────────────────────────────────────────────────
 
 /// Writes a nullable typed String: type code 101 (NULL) or type code 9 (STRING) +
@@ -417,6 +460,29 @@ mod tests {
         encode_value(&mut buf, &val);
         let mut bytes = buf.freeze();
         decode_value(&mut bytes).unwrap()
+    }
+
+    #[test]
+    fn read_uuid_obj_reads_type_code_and_two_le_longs() {
+        // [u8: 10][i64 LE msb][i64 LE lsb] → new UUID(msb, lsb).
+        let msb: u64 = 0x0102_0304_0506_0708;
+        let lsb: u64 = 0x1112_1314_1516_1718;
+        let mut buf = BytesMut::new();
+        buf.put_u8(type_code::UUID);
+        buf.put_i64_le(msb as i64);
+        buf.put_i64_le(lsb as i64);
+        let mut bytes = buf.freeze();
+        let got = read_uuid_obj(&mut bytes).unwrap();
+        assert_eq!(got, Some(Uuid::from_u64_pair(msb, lsb)));
+        assert_eq!(bytes.remaining(), 0, "all bytes consumed");
+    }
+
+    #[test]
+    fn read_uuid_obj_null_flag_yields_none() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(type_code::NULL);
+        let mut bytes = buf.freeze();
+        assert_eq!(read_uuid_obj(&mut bytes).unwrap(), None);
     }
 
     #[test]

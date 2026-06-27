@@ -11,8 +11,15 @@ use crate::transport::{IgniteConnection, TransportError};
 
 #[derive(Clone)]
 pub struct IgniteClientConfig {
-    /// "host:port" address of a cluster node
+    /// "host:port" address of the primary cluster node (first of [`Self::addresses`]).
     pub address: String,
+    /// All configured "host:port" node addresses.  Partition-aware routing
+    /// connects to each and routes keys to their owning node.  A single-element
+    /// list reproduces the original single-node behaviour.
+    pub addresses: Vec<String>,
+    /// Partition awareness toggle.  `None` = auto (enabled when ≥ 2 addresses
+    /// are configured and the server supports it); `Some(b)` forces it.
+    pub partition_awareness: Option<bool>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub max_pool_size: usize,
@@ -36,8 +43,11 @@ pub struct IgniteClientConfig {
 
 impl IgniteClientConfig {
     pub fn new(address: impl Into<String>) -> Self {
+        let address = address.into();
         Self {
-            address: address.into(),
+            addresses: vec![address.clone()],
+            address,
+            partition_awareness: None,
             username: None,
             password: None,
             max_pool_size: 10,
@@ -47,6 +57,23 @@ impl IgniteClientConfig {
             use_tls: false,
             tls_accept_invalid_certs: false,
         }
+    }
+
+    /// Configure the full set of cluster node addresses for partition-aware
+    /// routing.  The first entry becomes the primary [`Self::address`].
+    /// An empty list is ignored (the existing address is retained).
+    pub fn with_addresses(mut self, addresses: Vec<String>) -> Self {
+        if let Some(first) = addresses.first() {
+            self.address = first.clone();
+            self.addresses = addresses;
+        }
+        self
+    }
+
+    /// Force partition awareness on or off, overriding the auto default.
+    pub fn with_partition_awareness(mut self, enabled: bool) -> Self {
+        self.partition_awareness = Some(enabled);
+        self
     }
 
     pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
@@ -101,6 +128,8 @@ impl fmt::Debug for IgniteClientConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IgniteClientConfig")
             .field("address", &self.address)
+            .field("addresses", &self.addresses)
+            .field("partition_awareness", &self.partition_awareness)
             .field("username", &self.username)
             .field("password", &self.password.as_deref().map(|_| "[REDACTED]"))
             .field("max_pool_size", &self.max_pool_size)
@@ -164,6 +193,15 @@ impl Manager for IgniteConnectionManager {
 }
 
 pub(crate) type Pool = deadpool::managed::Pool<IgniteConnectionManager>;
+pub(crate) type PooledConn = deadpool::managed::Object<IgniteConnectionManager>;
+
+/// Build a pool targeting a specific `addr`, inheriting all other settings from
+/// `config`.  Used by the channel registry to open one pool per node address.
+pub(crate) fn build_pool_for_addr(config: &IgniteClientConfig, addr: &str) -> Pool {
+    let mut cfg = config.clone();
+    cfg.address = addr.to_string();
+    build_pool(cfg)
+}
 
 // Pool builder only errors when max_size=0; our config default (10) prevents that.
 #[allow(clippy::expect_used)]
@@ -186,4 +224,38 @@ pub(crate) fn build_pool(config: IgniteClientConfig) -> Pool {
         })
         .build()
         .expect("pool construction is infallible with valid config")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_populates_addresses_from_single_address() {
+        let c = IgniteClientConfig::new("host:10800");
+        assert_eq!(c.addresses, vec!["host:10800".to_string()]);
+        assert_eq!(c.address, "host:10800");
+    }
+
+    #[test]
+    fn with_addresses_sets_list_and_primary() {
+        let c = IgniteClientConfig::new("a:1")
+            .with_addresses(vec!["n1:1".into(), "n2:2".into()]);
+        assert_eq!(
+            c.addresses,
+            vec!["n1:1".to_string(), "n2:2".to_string()]
+        );
+        assert_eq!(c.address, "n1:1", "primary tracks the first address");
+    }
+
+    #[test]
+    fn partition_awareness_defaults_to_auto() {
+        assert_eq!(IgniteClientConfig::new("a:1").partition_awareness, None);
+        assert_eq!(
+            IgniteClientConfig::new("a:1")
+                .with_partition_awareness(true)
+                .partition_awareness,
+            Some(true)
+        );
+    }
 }
