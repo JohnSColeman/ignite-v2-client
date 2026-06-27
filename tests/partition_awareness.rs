@@ -77,6 +77,39 @@ async fn pa_put_get_roundtrip_is_correct() {
     c.destroy_cache("PA_ROUNDTRIP").await.ok();
 }
 
+/// Endpoint discovery: configure ONLY one node but force partition awareness on.
+/// The client should discover the other cluster nodes (op
+/// `CLUSTER_GROUP_GET_NODE_ENDPOINTS`), open channels to them, and still serve
+/// every key correctly. Run with `RUST_LOG=ignite_client=debug` to observe the
+/// `endpoint discovery complete` log with the number of nodes added.
+#[tokio::test]
+async fn pa_endpoint_discovery_reaches_unconfigured_nodes() {
+    init_tracing();
+    let cfg = IgniteClientConfig::new("localhost:10800").with_partition_awareness(true);
+    let c = IgniteClient::new(cfg);
+
+    let cache = c
+        .get_or_create_cache("PA_DISCOVERY")
+        .await
+        .expect("create cache");
+
+    for k in 0..120i32 {
+        cache
+            .put(IgniteValue::Int(k), IgniteValue::Int(k * 2))
+            .await
+            .unwrap_or_else(|e| panic!("put {k} failed: {e}"));
+    }
+    for k in 0..120i32 {
+        let got = cache
+            .get(IgniteValue::Int(k))
+            .await
+            .unwrap_or_else(|e| panic!("get {k} failed: {e}"));
+        assert_eq!(got, IgniteValue::Int(k * 2), "key {k} read back wrong value");
+    }
+
+    c.destroy_cache("PA_DISCOVERY").await.ok();
+}
+
 /// Partition awareness is a pure optimization: results must be identical whether
 /// it is on or off.  Writes go through a PA-on client; reads are verified through
 /// both a PA-on and a PA-off client.

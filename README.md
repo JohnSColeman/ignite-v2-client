@@ -72,7 +72,7 @@ over TCP.
 | Client-side request timeouts | ✅ |
 | Multi-node connection registry (one pool per node, keyed by node UUID) | ✅ |
 | Partition awareness / affinity routing (primary-node routing for KV ops) | ✅ |
-| Server endpoint discovery (auto-learn nodes not in the address list) | 🔲 Future |
+| Server endpoint discovery (auto-learn nodes not in the address list) | ✅ |
 | Backup-node routing for read-only ops | 🔲 Future |
 
 ---
@@ -118,7 +118,8 @@ ignite-client/
 │   ├── affinity.rs         ← partition awareness: key hashing, rendezvous partition/mask,
 │   │                          CACHE_PARTITIONS codec, AffinityContext (mappings + refresh)
 │   ├── channel.rs          ← ChannelRegistry: one pool per node, node-UUID→pool routing,
-│   │                          round-robin fallback, lazy mapping refresh
+│   │                          round-robin fallback, lazy mapping refresh, endpoint discovery
+│   ├── discovery.rs        ← server endpoint discovery codec (CLUSTER_GROUP_GET_NODE_ENDPOINTS)
 │   ├── stream.rs           ← QueryStream: lazily-paged streaming cursor
 │   ├── query.rs            ← QueryResult, Row, Column, ColumnType, UpdateResult
 │   ├── pool.rs             ← IgniteClientConfig, deadpool manager
@@ -141,7 +142,7 @@ ignite-client/
 │   ├── functional_query.rs ←  6 SQL query behaviour tests (pagination, mixed KV+SQL, errors)
 │   ├── functional_cache.rs ←  5 KV cache API lifecycle and operation tests
 │   ├── transaction.rs      ←  3 concurrent transaction correctness tests
-│   └── partition_awareness.rs ← 2 affinity-routing tests (roundtrip + PA-on/off parity)
+│   └── partition_awareness.rs ← 3 affinity-routing tests (roundtrip, discovery, PA-on/off parity)
 ├── local-cluster/          ← scripts + config for a local 3-node test cluster
 │   ├── ignite-config.xml   ← static-discovery node config (partitioned cache, thin connector)
 │   ├── start.sh            ← launch 3 nodes on ports 10800/10801/10802
@@ -341,6 +342,7 @@ pub struct IgniteClientConfig {
     pub address: String,                  // primary "host:port" (first of `addresses`)
     pub addresses: Vec<String>,           // all cluster node addresses (for routing)
     pub partition_awareness: Option<bool>,// None = auto (on when ≥ 2 addresses); Some(b) forces it
+    pub endpoint_discovery: Option<bool>, // None = auto (on); learn nodes not in `addresses`
     pub username: Option<String>,
     pub password: Option<String>,
     pub max_pool_size: usize,             // default: 10 (per node)
@@ -355,6 +357,7 @@ impl IgniteClientConfig {
     pub fn new(address: impl Into<String>) -> Self;       // single-node convenience
     pub fn with_addresses(self, addresses: Vec<String>) -> Self;   // multi-node cluster
     pub fn with_partition_awareness(self, enabled: bool) -> Self;  // force PA on/off
+    pub fn with_endpoint_discovery(self, enabled: bool) -> Self;   // force discovery on/off
     pub fn with_auth(self, username, password) -> Self;
     pub fn with_pool_size(self, size: usize) -> Self;
     pub fn with_connect_timeout(self, duration: Duration) -> Self;
@@ -724,6 +727,12 @@ target pool — falls back to the default channel, so observable results are
 always identical to the single-node path. Multi-key ops (`get_all`, `put_all`),
 SQL, and transactions use the default channel.
 
+**Endpoint discovery.** When partition awareness is enabled, on first use the
+client also asks the cluster for the full set of server node endpoints
+(`CLUSTER_GROUP_GET_NODE_ENDPOINTS`, op 5102) and opens channels to any node not
+in the configured address list — so you can list a single bootstrap address and
+still route to every node. Toggle with `with_endpoint_discovery(true|false)`.
+
 **Enablement.** Auto-on when two or more addresses are configured; override with
 `with_partition_awareness(true|false)`. Configure the cluster with:
 
@@ -742,7 +751,7 @@ cache.put(IgniteValue::Int(42), IgniteValue::Long(7)).await?; // routed to key 4
 
 Scope: routing currently covers primitive, `String`, and `UUID` keys (the types
 with well-defined, exactly-replicable Java hash codes). Custom affinity-key
-fields, backup-node routing, and server endpoint discovery are future work.
+fields are future work.
 
 ---
 
@@ -851,6 +860,8 @@ Covers:
     refresh; `PoolSelector` node→pool mapping and round-robin fallback
   - `CACHE_PARTITIONS` opcode (1101), node-UUID and feature-bitmask handshake
     parsing, and response-header topology-version capture
+  - endpoint discovery (`src/discovery.rs`): `CLUSTER_GROUP_GET_NODE_ENDPOINTS`
+    (opcode 5102) request/response codec and typed-string/raw-UUID readers
 
 ### Integration tests (require a live Ignite 2.x node on localhost:10800)
 
@@ -1009,7 +1020,7 @@ Rust port of selected tests from Apache Ignite's `BlockingTxOpsTest.java`.
 
 ---
 
-### `tests/partition_awareness.rs` — 2 tests
+### `tests/partition_awareness.rs` — 3 tests
 
 End-to-end affinity-routing tests. Set `IGNITE_ADDRS` to route across multiple
 nodes; otherwise they run against the single default address.
@@ -1017,6 +1028,7 @@ nodes; otherwise they run against the single default address.
 | Test | What it verifies |
 |---|---|
 | `pa_put_get_roundtrip_is_correct` | A spread of keys `put`/`get` correctly with partition awareness on — the routed write/read path returns every stored value |
+| `pa_endpoint_discovery_reaches_unconfigured_nodes` | Configured with one node + PA forced on, the client discovers the rest of the cluster and still serves every key |
 | `pa_on_and_off_agree` | Reading the same keys through a PA-on and a PA-off client yields identical results (the fail-safe guarantee: routing never changes observable results) |
 
 Enable `RUST_LOG=ignite_client=debug` to see routing decisions, e.g.

@@ -20,6 +20,10 @@ pub struct IgniteClientConfig {
     /// Partition awareness toggle.  `None` = auto (enabled when ≥ 2 addresses
     /// are configured and the server supports it); `Some(b)` forces it.
     pub partition_awareness: Option<bool>,
+    /// Server endpoint discovery toggle.  `None` = auto (on); `Some(b)` forces
+    /// it.  Only has effect when partition awareness is enabled — the client
+    /// then learns cluster nodes not in [`Self::addresses`] and routes to them.
+    pub endpoint_discovery: Option<bool>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub max_pool_size: usize,
@@ -48,6 +52,7 @@ impl IgniteClientConfig {
             addresses: vec![address.clone()],
             address,
             partition_awareness: None,
+            endpoint_discovery: None,
             username: None,
             password: None,
             max_pool_size: 10,
@@ -73,6 +78,13 @@ impl IgniteClientConfig {
     /// Force partition awareness on or off, overriding the auto default.
     pub fn with_partition_awareness(mut self, enabled: bool) -> Self {
         self.partition_awareness = Some(enabled);
+        self
+    }
+
+    /// Force server endpoint discovery on or off, overriding the auto default.
+    /// Only effective when partition awareness is enabled.
+    pub fn with_endpoint_discovery(mut self, enabled: bool) -> Self {
+        self.endpoint_discovery = Some(enabled);
         self
     }
 
@@ -130,6 +142,7 @@ impl fmt::Debug for IgniteClientConfig {
             .field("address", &self.address)
             .field("addresses", &self.addresses)
             .field("partition_awareness", &self.partition_awareness)
+            .field("endpoint_discovery", &self.endpoint_discovery)
             .field("username", &self.username)
             .field("password", &self.password.as_deref().map(|_| "[REDACTED]"))
             .field("max_pool_size", &self.max_pool_size)

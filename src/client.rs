@@ -32,7 +32,7 @@ impl IgniteClient {
     /// nodes are configured, unless explicitly overridden in the config.
     pub fn new(config: IgniteClientConfig) -> Self {
         let config = Arc::new(config);
-        let registry = Arc::new(ChannelRegistry::new(&config));
+        let registry = Arc::new(ChannelRegistry::new(config.clone()));
         let enabled = config
             .partition_awareness
             .unwrap_or(registry.node_count() >= 2);

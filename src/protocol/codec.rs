@@ -75,6 +75,20 @@ pub fn read_string(buf: &mut Bytes) -> Result<String> {
     read_string_nullable(buf)?.ok_or(ProtocolError::UnexpectedNull)
 }
 
+/// Reads an Ignite binary-protocol String *object*: a 1-byte type-code flag
+/// (`9` = STRING, `101` = NULL) then, for STRING, an `i32` LE length and that
+/// many UTF-8 bytes.  Matches Java `BinaryReaderEx.writeString`/`readString`
+/// (used e.g. for node addresses in the endpoints response), as opposed to the
+/// raw length-prefixed [`read_string`] used for SQL field names.
+pub fn read_string_obj(buf: &mut Bytes) -> Result<Option<String>> {
+    let flag = read_u8(buf)?;
+    match flag {
+        type_code::NULL => Ok(None),
+        type_code::STRING => Ok(Some(read_string(buf)?)),
+        other => Err(ProtocolError::UnknownTypeCode(other)),
+    }
+}
+
 /// Reads a bool (1 byte, 0=false, else true).
 pub fn read_bool(buf: &mut Bytes) -> Result<bool> {
     require(buf, 1)?;
@@ -483,6 +497,26 @@ mod tests {
         buf.put_u8(type_code::NULL);
         let mut bytes = buf.freeze();
         assert_eq!(read_uuid_obj(&mut bytes).unwrap(), None);
+    }
+
+    #[test]
+    fn read_string_obj_reads_typed_string() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(type_code::STRING);
+        let s = "127.0.0.1";
+        buf.put_i32_le(s.len() as i32);
+        buf.put_slice(s.as_bytes());
+        let mut bytes = buf.freeze();
+        assert_eq!(read_string_obj(&mut bytes).unwrap(), Some(s.to_string()));
+        assert_eq!(bytes.remaining(), 0);
+    }
+
+    #[test]
+    fn read_string_obj_null_flag_yields_none() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(type_code::NULL);
+        let mut bytes = buf.freeze();
+        assert_eq!(read_string_obj(&mut bytes).unwrap(), None);
     }
 
     #[test]

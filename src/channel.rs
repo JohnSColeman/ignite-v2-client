@@ -5,8 +5,9 @@
 //! `nodeChannels` map and default-channel fallback.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tracing::debug;
 use uuid::Uuid;
@@ -14,6 +15,9 @@ use uuid::Uuid;
 use crate::affinity::{
     AffinityContext, CachePartitionsResponse, decode_cache_partitions,
     encode_cache_partitions_request,
+};
+use crate::discovery::{
+    NodeEndpointsResponse, UNKNOWN_TOP_VER, decode_node_endpoints, encode_node_endpoints_request,
 };
 use crate::error::{IgniteError, Result};
 use crate::pool::{IgniteClientConfig, Pool, PooledConn, build_pool_for_addr};
@@ -61,39 +65,59 @@ impl PoolSelector {
 
 // ─── ChannelRegistry ──────────────────────────────────────────────────────────
 
-/// One connection pool per configured node address, plus the learned
-/// `node UUID → pool` map and a record of the newest topology version seen.
+/// One connection pool per node — configured seed addresses plus any nodes
+/// learned via endpoint discovery — keyed by node UUID, with a default
+/// round-robin/fallback over the seeds. Mirrors Java `ReliableChannelImpl`'s
+/// `nodeChannels` map.
 pub(crate) struct ChannelRegistry {
-    pools: Vec<Pool>,
+    config: Arc<IgniteClientConfig>,
+    /// Seed pools (indices `0..seed_count`) followed by discovered pools.
+    pools: Mutex<Vec<Pool>>,
+    /// Clone of the primary (seed 0) pool, kept lock-free for status checks.
+    primary_pool: Pool,
+    seed_count: usize,
     selector: PoolSelector,
     /// Newest affinity topology version observed on any response header.
     latest_topology: Mutex<Option<(i64, i32)>>,
+    /// Single-flight guard so endpoint discovery runs at most once.
+    discovery_done: AtomicBool,
 }
 
 impl ChannelRegistry {
-    pub(crate) fn new(config: &IgniteClientConfig) -> Self {
+    pub(crate) fn new(config: Arc<IgniteClientConfig>) -> Self {
         let pools: Vec<Pool> = config
             .addresses
             .iter()
-            .map(|addr| build_pool_for_addr(config, addr))
+            .map(|addr| build_pool_for_addr(&config, addr))
             .collect();
-        let count = pools.len();
+        let seed_count = pools.len();
+        // config always has ≥ 1 address, so pools[0] exists.
+        let primary_pool = pools[0].clone();
         Self {
-            pools,
-            selector: PoolSelector::new(count),
+            config,
+            pools: Mutex::new(pools),
+            primary_pool,
+            seed_count,
+            selector: PoolSelector::new(seed_count),
             latest_topology: Mutex::new(None),
+            discovery_done: AtomicBool::new(false),
         }
     }
 
-    /// Number of configured node pools.
+    /// Number of configured (seed) node pools.
     pub(crate) fn node_count(&self) -> usize {
-        self.pools.len()
+        self.seed_count
     }
 
     /// deadpool status of the primary pool, for observability.
     pub(crate) fn primary_status(&self) -> deadpool::managed::Status {
-        // `new` always builds at least one pool (config always has ≥ 1 address).
-        self.pools[0].status()
+        self.primary_pool.status()
+    }
+
+    /// A clone of the pool at `idx`, if it exists. Pools are `Arc`-backed so the
+    /// clone is cheap and lets us release the lock before awaiting `get()`.
+    fn pool_at(&self, idx: usize) -> Option<Pool> {
+        self.pools.lock().ok()?.get(idx).cloned()
     }
 
     /// Check out a connection to the `target` node when it is known, otherwise a
@@ -104,17 +128,18 @@ impl ChannelRegistry {
         // target pool) falls through to the default set so results never change.
         if let Some(node) = target
             && let Some(idx) = self.selector.index_for_node(node)
-            && let Ok(conn) = self.pools[idx].get().await
+            && let Some(pool) = self.pool_at(idx)
+            && let Ok(conn) = pool.get().await
         {
             return Ok(conn);
         }
         self.get_default().await
     }
 
-    /// Round-robin checkout across the default pool set, trying each pool once
+    /// Round-robin checkout across the seed pool set, trying each pool once
     /// before giving up.  Learns the node UUID served by whichever pool answers.
     async fn get_default(&self) -> Result<PooledConn> {
-        let n = self.pools.len();
+        let n = self.seed_count;
         if n == 0 {
             return Err(IgniteError::Pool("no channels configured".into()));
         }
@@ -122,7 +147,10 @@ impl ChannelRegistry {
         let mut last_err: Option<IgniteError> = None;
         for off in 0..n {
             let idx = (start + off) % n;
-            match self.pools[idx].get().await {
+            let Some(pool) = self.pool_at(idx) else {
+                continue;
+            };
+            match pool.get().await {
                 Ok(conn) => {
                     if let Some(node) = conn.node_id() {
                         self.selector.register_node(node, idx);
@@ -133,6 +161,88 @@ impl ChannelRegistry {
             }
         }
         Err(last_err.unwrap_or_else(|| IgniteError::Pool("all channels unavailable".into())))
+    }
+
+    // ── Endpoint discovery ────────────────────────────────────────────────────
+
+    /// Add a pool for a discovered node endpoint if its UUID is not already
+    /// known. Returns `true` when a new pool was added.
+    fn add_endpoint(&self, node_id: Uuid, addr: &str) -> bool {
+        if self.selector.index_for_node(node_id).is_some() {
+            return false;
+        }
+        let pool = build_pool_for_addr(&self.config, addr);
+        let idx = match self.pools.lock() {
+            Ok(mut pools) => {
+                pools.push(pool);
+                pools.len() - 1
+            }
+            Err(_) => return false,
+        };
+        self.selector.register_node(node_id, idx);
+        true
+    }
+
+    /// Discover all cluster node endpoints (single-flight) and open channels to
+    /// nodes not already known, so affinity routing can reach nodes that were
+    /// not in the configured address list. No-op when endpoint discovery is
+    /// disabled in the config.
+    pub(crate) async fn discover(&self) {
+        if !self.config.endpoint_discovery.unwrap_or(true) {
+            return;
+        }
+        if self.discovery_done.swap(true, Ordering::AcqRel) {
+            return; // already done by another task
+        }
+        // Learn each seed node's UUID first so discovery does not re-add them.
+        self.prime_seed_nodes().await;
+
+        match self.fetch_endpoints().await {
+            Ok(resp) => {
+                let mut added = 0usize;
+                for ep in &resp.added {
+                    // Use the first advertised address; an unreachable choice is
+                    // harmless — routing to that node just falls back to default.
+                    if let Some(addr) = ep.addresses.first()
+                        && self.add_endpoint(ep.node_id, &format!("{addr}:{}", ep.port))
+                    {
+                        added += 1;
+                    }
+                }
+                debug!(
+                    nodes = resp.added.len(),
+                    added, "endpoint discovery complete"
+                );
+            }
+            Err(e) => {
+                // Allow a later op to retry.
+                self.discovery_done.store(false, Ordering::Release);
+                debug!(error = %e, "endpoint discovery failed; using configured nodes only");
+            }
+        }
+    }
+
+    /// Open a connection to each seed pool to learn (and register) its node UUID.
+    async fn prime_seed_nodes(&self) {
+        for idx in 0..self.seed_count {
+            if let Some(pool) = self.pool_at(idx)
+                && let Ok(conn) = pool.get().await
+                && let Some(node) = conn.node_id()
+            {
+                self.selector.register_node(node, idx);
+            }
+        }
+    }
+
+    async fn fetch_endpoints(&self) -> Result<NodeEndpointsResponse> {
+        let req_id = next_request_id();
+        let payload = encode_node_endpoints_request(req_id, UNKNOWN_TOP_VER);
+        let conn = self.get_default().await?;
+        let mut resp = conn
+            .request(req_id, payload)
+            .await
+            .map_err(IgniteError::Transport)?;
+        decode_node_endpoints(&mut resp).map_err(IgniteError::Protocol)
     }
 
     /// Record the newest topology version a connection has observed, so the
@@ -157,6 +267,9 @@ impl ChannelRegistry {
         if !affinity.is_enabled() {
             return;
         }
+        // Learn any cluster nodes not in the configured address list (once), so
+        // routing can reach them.
+        self.discover().await;
         if !affinity.needs_refresh(cache_id, self.latest_topology()) {
             return;
         }
